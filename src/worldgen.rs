@@ -205,6 +205,15 @@ pub struct WorldGenConfig {
     pub terrain_height: f64,
     pub cave_scale: f64,
     pub cave_threshold: f64,
+    // Cave system parameters
+    pub cave_worm_scale: f64,       // Scale for worm-like cave tunnels
+    pub cave_worm_threshold: f64,   // Threshold for worm caves (lower = more caves)
+    pub cave_cheese_scale: f64,     // Scale for cheese-like cave pockets
+    pub cave_cheese_threshold: f64, // Threshold for cheese caves
+    // Ravine parameters
+    pub ravine_scale: f64,          // Scale for ravine noise
+    pub ravine_threshold: f64,      // Threshold for ravines (higher = fewer)
+    pub ravine_depth_scale: f64,    // How deep ravines cut
 }
 
 impl Default for WorldGenConfig {
@@ -216,6 +225,16 @@ impl Default for WorldGenConfig {
             terrain_height: 32.0,
             cave_scale: 0.08,
             cave_threshold: 0.55,
+            // Spaghetti/worm caves - thin winding tunnels
+            cave_worm_scale: 0.04,
+            cave_worm_threshold: 0.03,
+            // Cheese caves - larger pockets
+            cave_cheese_scale: 0.06,
+            cave_cheese_threshold: 0.7,
+            // Ravines - deep vertical cuts
+            ravine_scale: 0.015,
+            ravine_threshold: 0.85,
+            ravine_depth_scale: 40.0,
         }
     }
 }
@@ -230,6 +249,15 @@ pub struct WorldGenerator {
     cave_noise_2: Simplex,
     ore_noise: Perlin,
     biome_noise: Perlin,
+    // Additional noise for improved caves and ravines
+    cave_worm_noise_x: Simplex,   // 3D noise for worm cave X displacement
+    cave_worm_noise_y: Simplex,   // 3D noise for worm cave Y displacement
+    cave_worm_noise_z: Simplex,   // 3D noise for worm cave Z displacement
+    cave_cheese_noise: Simplex,   // 3D noise for cheese caves (large pockets)
+    ravine_noise: Perlin,         // 2D noise for ravine placement
+    ravine_depth_noise: Perlin,   // Noise for ravine depth variation
+    // Biome blend noise for irregular transitions
+    biome_blend_noise: Simplex,   // Adds irregularity to biome boundaries
 }
 
 impl WorldGenerator {
@@ -249,6 +277,15 @@ impl WorldGenerator {
             cave_noise_2: Simplex::new(seed.wrapping_add(3)),
             ore_noise: Perlin::new(seed.wrapping_add(4)),
             biome_noise: Perlin::new(seed.wrapping_add(5)),
+            // Additional noise for improved caves and ravines
+            cave_worm_noise_x: Simplex::new(seed.wrapping_add(10)),
+            cave_worm_noise_y: Simplex::new(seed.wrapping_add(11)),
+            cave_worm_noise_z: Simplex::new(seed.wrapping_add(12)),
+            cave_cheese_noise: Simplex::new(seed.wrapping_add(13)),
+            ravine_noise: Perlin::new(seed.wrapping_add(20)),
+            ravine_depth_noise: Perlin::new(seed.wrapping_add(21)),
+            // Biome blend noise
+            biome_blend_noise: Simplex::new(seed.wrapping_add(30)),
             config,
             biomes_config,
         }
@@ -370,10 +407,30 @@ impl WorldGenerator {
     /// Returns a vector of (biome_index, weight) pairs for biomes with non-zero weights
     fn get_biome_weights(&self, x: i32, z: i32) -> Vec<(usize, f64)> {
         let scale = self.biomes_config.biome_scale;
-        let temperature = self.biome_noise.get([x as f64 * scale, z as f64 * scale]);
-        let moisture = self
+        let base_temperature = self.biome_noise.get([x as f64 * scale, z as f64 * scale]);
+        let base_moisture = self
             .biome_noise
             .get([x as f64 * scale + 1000.0, z as f64 * scale + 1000.0]);
+
+        // Add noise to create irregular biome boundaries
+        // Use a higher frequency noise to create jagged edges
+        let blend_noise_scale = self.biomes_config.biome_scale * 8.0; // Higher frequency for detail
+        let blend_noise_strength = self.biomes_config.blend_noise_strength;
+
+        // Sample noise for temperature and moisture perturbation
+        let temp_noise = self.biome_blend_noise.get([
+            x as f64 * blend_noise_scale,
+            z as f64 * blend_noise_scale,
+        ]) * blend_noise_strength;
+
+        let moisture_noise = self.biome_blend_noise.get([
+            x as f64 * blend_noise_scale + 500.0,
+            z as f64 * blend_noise_scale + 500.0,
+        ]) * blend_noise_strength;
+
+        // Apply noise perturbation
+        let temperature = base_temperature + temp_noise;
+        let moisture = base_moisture + moisture_noise;
 
         // Blend radius in temperature/moisture space (how far to blend at biome edges)
         let blend_radius = self.biomes_config.blend_radius;
@@ -499,23 +556,155 @@ impl WorldGenerator {
         BlockType::Stone
     }
 
+    /// Check if a position should be carved out as a cave or ravine
     fn is_cave(&self, x: i32, y: i32, z: i32) -> bool {
-        if y < 5 || y > self.config.sea_level + 30 {
+        // Don't carve below y=5 (bedrock layer)
+        if y < 5 {
             return false;
         }
 
-        let scale = self.config.cave_scale;
-        let noise1 = self
-            .cave_noise
-            .get([x as f64 * scale, y as f64 * scale, z as f64 * scale]);
-        let noise2 = self.cave_noise_2.get([
-            x as f64 * scale * 2.0,
-            y as f64 * scale * 2.0,
-            z as f64 * scale * 2.0,
+        // Check for ravines first (they can go higher than caves)
+        if y <= self.config.sea_level + 50 && self.is_ravine(x, y, z) {
+            return true;
+        }
+
+        // Caves only below a certain height
+        let max_cave_height = self.config.sea_level + 40;
+        if y > max_cave_height {
+            return false;
+        }
+
+        // Calculate depth factor for cave density (more caves deeper underground)
+        let depth_below_surface = (max_cave_height - y) as f64;
+        let depth_factor = (depth_below_surface / 50.0).clamp(0.0, 1.0);
+
+        // === Spaghetti/Worm Caves ===
+        // Creates connected tunnel networks by finding where two 3D noise "surfaces" intersect
+        let worm_scale = self.config.cave_worm_scale;
+
+        // Sample two independent 3D noise fields
+        let worm_a = self.cave_worm_noise_x.get([
+            x as f64 * worm_scale,
+            y as f64 * worm_scale * 0.4, // Stretch vertically for more horizontal tunnels
+            z as f64 * worm_scale,
+        ]);
+        let worm_b = self.cave_worm_noise_y.get([
+            x as f64 * worm_scale * 0.8 + 1000.0,
+            y as f64 * worm_scale * 0.4,
+            z as f64 * worm_scale * 0.8 + 1000.0,
         ]);
 
-        let combined = (noise1.abs() + noise2.abs()) / 2.0;
-        combined > self.config.cave_threshold
+        // Cave exists where both noise values are close to zero
+        // Threshold increases with depth (more caves deeper)
+        let base_worm_threshold = self.config.cave_worm_threshold;
+        let worm_threshold = base_worm_threshold * (0.6 + 0.4 * depth_factor);
+
+        // Use squared distance from zero for smoother tunnel shapes
+        let worm_dist = (worm_a * worm_a + worm_b * worm_b).sqrt();
+        if worm_dist < worm_threshold {
+            return true;
+        }
+
+        // === Cheese Caves (Large Caverns) ===
+        // Only generate if threshold is reasonable (user can disable with threshold >= 1.0)
+        if self.config.cave_cheese_threshold < 1.0 {
+            let cheese_scale = self.config.cave_cheese_scale;
+            let cheese_noise = self.cave_cheese_noise.get([
+                x as f64 * cheese_scale,
+                y as f64 * cheese_scale * 0.5, // Flattened vertically for wider caverns
+                z as f64 * cheese_scale,
+            ]);
+
+            // Cheese caves more common at lower depths
+            let cheese_threshold = self.config.cave_cheese_threshold - depth_factor * 0.1;
+            if cheese_noise > cheese_threshold {
+                return true;
+            }
+        }
+
+        // === Additional tunnel layer for variety ===
+        // Uses the legacy noise but with better parameters
+        if self.config.cave_threshold < 1.0 {
+            let scale = self.config.cave_scale;
+            let noise1 = self.cave_noise.get([
+                x as f64 * scale,
+                y as f64 * scale * 0.5,
+                z as f64 * scale,
+            ]);
+            let noise2 = self.cave_noise_2.get([
+                x as f64 * scale * 1.5 + 500.0,
+                y as f64 * scale * 0.5,
+                z as f64 * scale * 1.5 + 500.0,
+            ]);
+
+            // Intersection of two noise surfaces creates tunnels
+            let tunnel_dist = (noise1 * noise1 + noise2 * noise2).sqrt();
+            let tunnel_threshold = (1.0 - self.config.cave_threshold) * 0.15 * (0.5 + 0.5 * depth_factor);
+            if tunnel_dist < tunnel_threshold {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Check if a position should be carved as a ravine
+    /// Ravines are deep, narrow canyons that cut through the terrain
+    fn is_ravine(&self, x: i32, y: i32, z: i32) -> bool {
+        let ravine_scale = self.config.ravine_scale;
+
+        // Use 2D noise to determine ravine placement (they go vertically)
+        let ravine_value = self.ravine_noise.get([
+            x as f64 * ravine_scale,
+            z as f64 * ravine_scale,
+        ]);
+
+        // Ravines only form where noise is very high
+        if ravine_value < self.config.ravine_threshold {
+            return false;
+        }
+
+        // Calculate ravine depth at this position
+        // Ravines are deeper where the noise is higher
+        let ravine_strength = (ravine_value - self.config.ravine_threshold) / (1.0 - self.config.ravine_threshold);
+
+        // Add some variation to the ravine depth using another noise
+        let depth_variation = self.ravine_depth_noise.get([
+            x as f64 * ravine_scale * 3.0,
+            z as f64 * ravine_scale * 3.0,
+        ]);
+
+        // Calculate the bottom of the ravine at this XZ position
+        let base_depth = self.config.ravine_depth_scale * ravine_strength;
+        let varied_depth = base_depth * (0.7 + 0.3 * (depth_variation + 1.0) / 2.0);
+
+        // Get surface height to know where ravine starts
+        let surface_height = self.get_terrain_height(x, z);
+        let ravine_bottom = (surface_height as f64 - varied_depth) as i32;
+        let ravine_bottom = ravine_bottom.max(8); // Don't go below y=8
+
+        // Check if we're within the ravine's vertical extent
+        if y < ravine_bottom || y > surface_height - 1 {
+            return false;
+        }
+
+        // Make ravines narrower at the bottom (V-shaped profile)
+        let depth_into_ravine = (surface_height - y) as f64;
+        let max_depth = (surface_height - ravine_bottom) as f64;
+        let depth_ratio = depth_into_ravine / max_depth.max(1.0);
+
+        // Width decreases with depth (V-shape)
+        // At surface: full width, at bottom: narrow
+        let width_at_depth = 1.0 - depth_ratio * 0.7;
+
+        // Use noise to vary the width along the ravine
+        let width_noise = self.ravine_depth_noise.get([
+            x as f64 * ravine_scale * 5.0 + 500.0,
+            z as f64 * ravine_scale * 5.0 + 500.0,
+        ]);
+        let width_threshold = self.config.ravine_threshold + (1.0 - self.config.ravine_threshold) * (1.0 - width_at_depth) * (0.8 + 0.2 * width_noise);
+
+        ravine_value > width_threshold
     }
 
     fn get_ore(&self, x: i32, y: i32, z: i32) -> Option<BlockType> {
@@ -810,6 +999,13 @@ impl World {
             terrain_height: terrain_config.terrain_height,
             cave_scale: terrain_config.cave_scale,
             cave_threshold: terrain_config.cave_threshold,
+            cave_worm_scale: terrain_config.cave_worm_scale,
+            cave_worm_threshold: terrain_config.cave_worm_threshold,
+            cave_cheese_scale: terrain_config.cave_cheese_scale,
+            cave_cheese_threshold: terrain_config.cave_cheese_threshold,
+            ravine_scale: terrain_config.ravine_scale,
+            ravine_threshold: terrain_config.ravine_threshold,
+            ravine_depth_scale: terrain_config.ravine_depth_scale,
         };
 
         Self::with_world_gen_config(config, biomes_config, render_distance, height_chunks)

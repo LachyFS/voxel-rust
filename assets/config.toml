@@ -6,7 +6,7 @@
 render_distance = 10
 
 # Vertical render distance in chunks (16 blocks each, 24 = 384 blocks like Minecraft)
-height_chunks = 8
+height_chunks = 16
 
 [terrain]
 # World generation seed (same seed = same world)
@@ -21,11 +21,30 @@ terrain_scale = 0.01
 # Maximum terrain height variation in blocks
 terrain_height = 64.0
 
-# Cave generation scale (smaller = larger caves)
-cave_scale = 0.08
+# === Cave Generation ===
+# Worm/Spaghetti caves - main tunnel system
+# Scale (smaller = longer, more winding tunnels)
+cave_worm_scale = 0.018
+# Threshold (larger = wider tunnels, 0.02-0.06)
+cave_worm_threshold = 0.025
 
-# Cave threshold (higher = fewer caves, 0.0-1.0)
-cave_threshold = 0.55
+# Cheese caves - larger open caverns (set threshold to 1.0 to disable)
+# Scale (smaller = larger caverns)
+cave_cheese_scale = 0.04
+# Threshold (higher = fewer/smaller caves, 0.65-0.85)
+cave_cheese_threshold = 0.78
+
+# Secondary tunnel layer (set threshold to 1.0 to disable)
+cave_scale = 0.05
+cave_threshold = 0.4
+
+# === Ravine Generation ===
+# Scale (smaller = longer ravines)
+ravine_scale = 0.012
+# Threshold (higher = fewer ravines, 0.8-0.95)
+ravine_threshold = 0.88
+# Depth scale (how deep ravines cut, in blocks)
+ravine_depth_scale = 50.0
 
 [camera]
 # Field of view in degrees

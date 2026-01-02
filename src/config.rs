@@ -34,7 +34,36 @@ pub struct TerrainConfig {
     pub cave_scale: f64,
     /// Cave threshold (higher = fewer caves)
     pub cave_threshold: f64,
+    /// Worm cave scale (smaller = longer tunnels)
+    #[serde(default = "default_cave_worm_scale")]
+    pub cave_worm_scale: f64,
+    /// Worm cave threshold (smaller = more caves)
+    #[serde(default = "default_cave_worm_threshold")]
+    pub cave_worm_threshold: f64,
+    /// Cheese cave scale (smaller = larger caverns)
+    #[serde(default = "default_cave_cheese_scale")]
+    pub cave_cheese_scale: f64,
+    /// Cheese cave threshold (higher = fewer caves)
+    #[serde(default = "default_cave_cheese_threshold")]
+    pub cave_cheese_threshold: f64,
+    /// Ravine scale (smaller = longer ravines)
+    #[serde(default = "default_ravine_scale")]
+    pub ravine_scale: f64,
+    /// Ravine threshold (higher = fewer ravines)
+    #[serde(default = "default_ravine_threshold")]
+    pub ravine_threshold: f64,
+    /// Ravine depth scale (how deep ravines cut)
+    #[serde(default = "default_ravine_depth_scale")]
+    pub ravine_depth_scale: f64,
 }
+
+fn default_cave_worm_scale() -> f64 { 0.04 }
+fn default_cave_worm_threshold() -> f64 { 0.03 }
+fn default_cave_cheese_scale() -> f64 { 0.06 }
+fn default_cave_cheese_threshold() -> f64 { 0.7 }
+fn default_ravine_scale() -> f64 { 0.015 }
+fn default_ravine_threshold() -> f64 { 0.85 }
+fn default_ravine_depth_scale() -> f64 { 40.0 }
 
 #[derive(Debug, Deserialize)]
 pub struct CameraConfig {
@@ -73,6 +102,13 @@ impl Default for Config {
                 terrain_height: 32.0,
                 cave_scale: 0.08,
                 cave_threshold: 0.55,
+                cave_worm_scale: 0.04,
+                cave_worm_threshold: 0.03,
+                cave_cheese_scale: 0.06,
+                cave_cheese_threshold: 0.7,
+                ravine_scale: 0.015,
+                ravine_threshold: 0.85,
+                ravine_depth_scale: 40.0,
             },
             camera: CameraConfig {
                 fov: 90.0,
@@ -137,10 +173,17 @@ pub struct BiomeSettings {
     /// Blend radius for smooth biome transitions (default 0.15)
     #[serde(default = "default_blend_radius")]
     pub blend_radius: f64,
+    /// Noise strength for irregular biome boundaries (default 0.08)
+    #[serde(default = "default_blend_noise_strength")]
+    pub blend_noise_strength: f64,
 }
 
 fn default_blend_radius() -> f64 {
     0.15
+}
+
+fn default_blend_noise_strength() -> f64 {
+    0.08
 }
 
 #[derive(Debug, Deserialize)]
@@ -217,6 +260,8 @@ pub struct CompiledBiome {
 pub struct CompiledBiomesConfig {
     pub biome_scale: f64,
     pub blend_radius: f64,
+    /// Noise strength for irregular biome boundaries
+    pub blend_noise_strength: f64,
     pub biomes: Vec<CompiledBiome>,
 }
 
@@ -225,6 +270,7 @@ impl Default for CompiledBiomesConfig {
         Self {
             biome_scale: 0.005,
             blend_radius: 0.15,
+            blend_noise_strength: 0.08,
             biomes: vec![
                 CompiledBiome {
                     name: "plains".to_string(),
@@ -378,6 +424,7 @@ impl CompiledBiomesConfig {
         Self {
             biome_scale: config.settings.biome_scale,
             blend_radius: config.settings.blend_radius,
+            blend_noise_strength: config.settings.blend_noise_strength,
             biomes,
         }
     }

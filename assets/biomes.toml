@@ -20,6 +20,8 @@
 biome_scale = 0.005
 # Blend radius for smooth biome transitions (0.0 = hard edges, higher = smoother)
 blend_radius = 0.15
+# Noise strength for irregular biome boundaries (0.0 = smooth edges, higher = more jagged)
+blend_noise_strength = 0.08
 
 [biomes]
 
