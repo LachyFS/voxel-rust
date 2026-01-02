@@ -129,6 +129,12 @@ impl BlockType {
         )
     }
 
+    /// Returns true for foliage blocks that should be rendered as crossed quads
+    /// instead of cube faces (e.g., tall grass, dead bush)
+    pub fn is_foliage(&self) -> bool {
+        matches!(self, BlockType::DeadBush | BlockType::TallGrass)
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             BlockType::Air => "air",
@@ -535,7 +541,27 @@ impl Chunk {
             |tex| tex.sides,
         );
 
+        // Generate crossed quads for foliage blocks (tall grass, dead bush, etc.)
+        self.generate_foliage_mesh(texture_indices, chunk_offset);
+
         self.mesh.dirty = false;
+    }
+
+    /// Generate crossed quad meshes for foliage blocks
+    fn generate_foliage_mesh(&mut self, texture_indices: &BlockTextureArray, chunk_offset: Vec3) {
+        for x in 0..CHUNK_SIZE {
+            for y in 0..CHUNK_SIZE {
+                for z in 0..CHUNK_SIZE {
+                    let block = self.blocks[x][y][z];
+                    if block.is_foliage() {
+                        let pos = Vec3::new(x as f32, y as f32, z as f32) + chunk_offset;
+                        let tex = &texture_indices[block.as_index()];
+                        // Use the sides texture for foliage (which is the "all" texture)
+                        add_crossed_quads(&mut self.mesh.vertices, &mut self.mesh.indices, pos, tex.sides);
+                    }
+                }
+            }
+        }
     }
 
     /// Greedy mesh one face direction across all slices
@@ -570,7 +596,8 @@ impl Chunk {
                     let (x, y, z) = coord_mapper(axis, row, col);
                     let block = self.blocks[x][y][z];
 
-                    if !block.is_solid() {
+                    // Skip air and foliage blocks (foliage uses crossed quads, not cube faces)
+                    if !block.is_solid() || block.is_foliage() {
                         mask[row][col] = (NO_FACE, 0);
                         continue;
                     }
@@ -699,6 +726,12 @@ impl Chunk {
                     let pos = Vec3::new(x as f32, y as f32, z as f32) + chunk_offset;
                     // Direct array indexing - O(1) instead of HashMap lookup
                     let tex = &texture_indices[block.as_index()];
+
+                    // Foliage blocks use crossed quads instead of cube faces
+                    if block.is_foliage() {
+                        add_crossed_quads(&mut self.mesh.vertices, &mut self.mesh.indices, pos, tex.sides);
+                        continue;
+                    }
 
                     // +X face (Right)
                     let should_render_pos_x = if x == CHUNK_SIZE - 1 {
@@ -1305,6 +1338,108 @@ impl<'a> AoSampler<'a> {
             }
         }
     }
+}
+
+/// Add crossed quads for foliage blocks (two quads forming an X pattern)
+/// This creates a more natural look for grass, flowers, and other vegetation
+fn add_crossed_quads(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    pos: Vec3,
+    tex_layer: u32,
+) {
+    // Two diagonal quads forming an X when viewed from above
+    // Offset slightly inward from block edges for better appearance
+    let offset = 0.15; // Slight inset from block edges
+
+    // First diagonal: from (0,0) to (1,1) in XZ plane
+    add_foliage_quad(
+        vertices,
+        indices,
+        [pos.x + offset, pos.y, pos.z + offset],
+        [pos.x + 1.0 - offset, pos.y, pos.z + 1.0 - offset],
+        [pos.x + 1.0 - offset, pos.y + 1.0, pos.z + 1.0 - offset],
+        [pos.x + offset, pos.y + 1.0, pos.z + offset],
+        tex_layer,
+        [0.707, 0.0, 0.707], // Normal pointing diagonally
+    );
+
+    // Same quad, but facing the other way (for backface visibility)
+    add_foliage_quad(
+        vertices,
+        indices,
+        [pos.x + 1.0 - offset, pos.y, pos.z + 1.0 - offset],
+        [pos.x + offset, pos.y, pos.z + offset],
+        [pos.x + offset, pos.y + 1.0, pos.z + offset],
+        [pos.x + 1.0 - offset, pos.y + 1.0, pos.z + 1.0 - offset],
+        tex_layer,
+        [-0.707, 0.0, -0.707], // Opposite normal
+    );
+
+    // Second diagonal: from (1,0) to (0,1) in XZ plane
+    add_foliage_quad(
+        vertices,
+        indices,
+        [pos.x + 1.0 - offset, pos.y, pos.z + offset],
+        [pos.x + offset, pos.y, pos.z + 1.0 - offset],
+        [pos.x + offset, pos.y + 1.0, pos.z + 1.0 - offset],
+        [pos.x + 1.0 - offset, pos.y + 1.0, pos.z + offset],
+        tex_layer,
+        [-0.707, 0.0, 0.707], // Normal pointing diagonally
+    );
+
+    // Same quad, but facing the other way
+    add_foliage_quad(
+        vertices,
+        indices,
+        [pos.x + offset, pos.y, pos.z + 1.0 - offset],
+        [pos.x + 1.0 - offset, pos.y, pos.z + offset],
+        [pos.x + 1.0 - offset, pos.y + 1.0, pos.z + offset],
+        [pos.x + offset, pos.y + 1.0, pos.z + 1.0 - offset],
+        tex_layer,
+        [0.707, 0.0, -0.707], // Opposite normal
+    );
+}
+
+/// Add a single foliage quad with specified corners
+fn add_foliage_quad(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    p0: [f32; 3],
+    p1: [f32; 3],
+    p2: [f32; 3],
+    p3: [f32; 3],
+    tex_layer: u32,
+    normal: [f32; 3],
+) {
+    let base_index = vertices.len() as u32;
+
+    // UVs for a 1x1 texture quad
+    let uvs = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+    let positions = [p0, p1, p2, p3];
+
+    // Use full brightness (no AO) for foliage - they're thin and shouldn't occlude themselves
+    let ao = 1.0;
+
+    for i in 0..4 {
+        vertices.push(Vertex {
+            position: positions[i],
+            uv: uvs[i],
+            normal,
+            tex_layer,
+            ao,
+        });
+    }
+
+    // Two triangles for the quad
+    indices.extend_from_slice(&[
+        base_index,
+        base_index + 1,
+        base_index + 2,
+        base_index,
+        base_index + 2,
+        base_index + 3,
+    ]);
 }
 
 /// Add a merged face from greedy meshing with proper UV tiling

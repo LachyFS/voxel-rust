@@ -692,7 +692,7 @@ impl Renderer {
             block_textures,
             game_time: 0.35 * 120.0, // Start at sunrise (0.25 of day cycle)
             day_length: 120.0, // 2 minutes per full day cycle
-            time_frozen: true, // Start with time frozen
+            time_frozen: false, // Start with time frozen
         }
     }
 
