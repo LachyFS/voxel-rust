@@ -1,0 +1,49 @@
+# Biome Configuration
+# Defines how biomes are selected and what blocks they use
+#
+# Each biome has:
+#   temperature_min/max: Range for temperature noise (-1.0 to 1.0)
+#   moisture_min/max: Range for moisture noise (-1.0 to 1.0)
+#   surface_block: Block type for the surface layer
+#   subsurface_block: Block type for layers below surface (up to 4 blocks deep)
+#   stone_altitude: Height above sea level where stone replaces grass (optional)
+
+[settings]
+# Scale for biome noise (smaller = larger biomes)
+biome_scale = 0.005
+
+[biomes]
+
+[biomes.plains]
+temperature_min = -1.0
+temperature_max = 0.0
+moisture_min = 0.0
+moisture_max = 1.0
+surface_block = "grass"
+subsurface_block = "dirt"
+
+[biomes.forest]
+temperature_min = 0.0
+temperature_max = 1.0
+moisture_min = 0.0
+moisture_max = 1.0
+surface_block = "grass"
+subsurface_block = "dirt"
+
+[biomes.desert]
+temperature_min = 0.0
+temperature_max = 1.0
+moisture_min = -1.0
+moisture_max = 0.0
+surface_block = "sand"
+subsurface_block = "sand"
+
+[biomes.mountains]
+temperature_min = -1.0
+temperature_max = 0.0
+moisture_min = -1.0
+moisture_max = 0.0
+surface_block = "grass"
+subsurface_block = "dirt"
+# Above this height (relative to sea level), surface becomes stone
+stone_altitude = 20

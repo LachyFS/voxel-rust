@@ -3,10 +3,102 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 
 use crate::camera::Frustum;
-use crate::config::TerrainConfig;
+use crate::config::{CompiledBiome, CompiledBiomesConfig, TerrainConfig};
 use crate::texture::BlockTextureArray;
 use crate::voxel::{BlockType, Chunk, ChunkNeighbors, NeighborBoundaries, Vertex, CHUNK_SIZE};
 use glam::Vec3;
+
+// ============================================================================
+// Structure Generation
+// ============================================================================
+
+/// Maximum horizontal radius a structure can extend from its spawn point
+const STRUCTURE_CHECK_RADIUS: i32 = 5;
+
+/// Structure types that can spawn in the world
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum StructureType {
+    OakTree,
+    Cactus,
+}
+
+/// A block placement within a structure, relative to spawn point
+#[derive(Clone, Copy)]
+struct StructureBlock {
+    dx: i32, // Offset from spawn X
+    dy: i32, // Offset from spawn Y (spawn Y is surface + 1)
+    dz: i32, // Offset from spawn Z
+    block: BlockType,
+}
+
+/// Get the blocks that make up a structure
+fn get_structure_blocks(structure_type: StructureType) -> &'static [StructureBlock] {
+    match structure_type {
+        StructureType::OakTree => &OAK_TREE_BLOCKS,
+        StructureType::Cactus => &CACTUS_BLOCKS,
+    }
+}
+
+/// Oak tree: 5 blocks tall trunk + 3x3x3 leaf canopy at top
+static OAK_TREE_BLOCKS: [StructureBlock; 31] = [
+    // Trunk (5 blocks, y=0 to y=4)
+    StructureBlock { dx: 0, dy: 0, dz: 0, block: BlockType::Wood },
+    StructureBlock { dx: 0, dy: 1, dz: 0, block: BlockType::Wood },
+    StructureBlock { dx: 0, dy: 2, dz: 0, block: BlockType::Wood },
+    StructureBlock { dx: 0, dy: 3, dz: 0, block: BlockType::Wood },
+    StructureBlock { dx: 0, dy: 4, dz: 0, block: BlockType::Wood },
+    // Leaves layer 1 (y=3, 3x3 minus corners)
+    StructureBlock { dx: -1, dy: 3, dz: 0, block: BlockType::Leaves },
+    StructureBlock { dx: 1, dy: 3, dz: 0, block: BlockType::Leaves },
+    StructureBlock { dx: 0, dy: 3, dz: -1, block: BlockType::Leaves },
+    StructureBlock { dx: 0, dy: 3, dz: 1, block: BlockType::Leaves },
+    // Leaves layer 2 (y=4, 3x3)
+    StructureBlock { dx: -1, dy: 4, dz: -1, block: BlockType::Leaves },
+    StructureBlock { dx: -1, dy: 4, dz: 0, block: BlockType::Leaves },
+    StructureBlock { dx: -1, dy: 4, dz: 1, block: BlockType::Leaves },
+    StructureBlock { dx: 0, dy: 4, dz: -1, block: BlockType::Leaves },
+    // trunk at (0,4,0) - already added above
+    StructureBlock { dx: 0, dy: 4, dz: 1, block: BlockType::Leaves },
+    StructureBlock { dx: 1, dy: 4, dz: -1, block: BlockType::Leaves },
+    StructureBlock { dx: 1, dy: 4, dz: 0, block: BlockType::Leaves },
+    StructureBlock { dx: 1, dy: 4, dz: 1, block: BlockType::Leaves },
+    // Leaves layer 3 (y=5, 3x3)
+    StructureBlock { dx: -1, dy: 5, dz: -1, block: BlockType::Leaves },
+    StructureBlock { dx: -1, dy: 5, dz: 0, block: BlockType::Leaves },
+    StructureBlock { dx: -1, dy: 5, dz: 1, block: BlockType::Leaves },
+    StructureBlock { dx: 0, dy: 5, dz: -1, block: BlockType::Leaves },
+    StructureBlock { dx: 0, dy: 5, dz: 0, block: BlockType::Leaves },
+    StructureBlock { dx: 0, dy: 5, dz: 1, block: BlockType::Leaves },
+    StructureBlock { dx: 1, dy: 5, dz: -1, block: BlockType::Leaves },
+    StructureBlock { dx: 1, dy: 5, dz: 0, block: BlockType::Leaves },
+    StructureBlock { dx: 1, dy: 5, dz: 1, block: BlockType::Leaves },
+    // Top leaves (y=6, cross pattern)
+    StructureBlock { dx: 0, dy: 6, dz: 0, block: BlockType::Leaves },
+    StructureBlock { dx: -1, dy: 6, dz: 0, block: BlockType::Leaves },
+    StructureBlock { dx: 1, dy: 6, dz: 0, block: BlockType::Leaves },
+    StructureBlock { dx: 0, dy: 6, dz: -1, block: BlockType::Leaves },
+    StructureBlock { dx: 0, dy: 6, dz: 1, block: BlockType::Leaves },
+];
+
+/// Cactus: 3 blocks tall
+static CACTUS_BLOCKS: [StructureBlock; 3] = [
+    StructureBlock { dx: 0, dy: 0, dz: 0, block: BlockType::Leaves }, // Using Leaves as cactus placeholder
+    StructureBlock { dx: 0, dy: 1, dz: 0, block: BlockType::Leaves },
+    StructureBlock { dx: 0, dy: 2, dz: 0, block: BlockType::Leaves },
+];
+
+/// Deterministic hash for structure spawn decisions
+/// Returns a value 0-255 based on position and seed
+#[inline]
+fn structure_hash(x: i32, z: i32, seed: u32) -> u8 {
+    let mut h = (x as u32).wrapping_mul(73856093)
+        ^ (z as u32).wrapping_mul(19349663)
+        ^ seed.wrapping_mul(83492791);
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85ebca6b);
+    h ^= h >> 13;
+    (h & 0xFF) as u8
+}
 
 /// Chunk coordinate key for HashMap
 pub type ChunkPos = (i32, i32, i32);
@@ -37,6 +129,7 @@ impl Default for WorldGenConfig {
 /// Procedural world generator
 pub struct WorldGenerator {
     config: WorldGenConfig,
+    biomes_config: CompiledBiomesConfig,
     terrain_noise: Fbm<Perlin>,
     detail_noise: Perlin,
     cave_noise: Simplex,
@@ -46,7 +139,7 @@ pub struct WorldGenerator {
 }
 
 impl WorldGenerator {
-    pub fn new(config: WorldGenConfig) -> Self {
+    pub fn new(config: WorldGenConfig, biomes_config: CompiledBiomesConfig) -> Self {
         let seed = config.seed;
 
         let terrain_noise = Fbm::<Perlin>::new(seed)
@@ -63,6 +156,7 @@ impl WorldGenerator {
             ore_noise: Perlin::new(seed.wrapping_add(4)),
             biome_noise: Perlin::new(seed.wrapping_add(5)),
             config,
+            biomes_config,
         }
     }
 
@@ -72,6 +166,15 @@ impl WorldGenerator {
         let world_x = chunk_x * CHUNK_SIZE as i32;
         let world_y = chunk_y * CHUNK_SIZE as i32;
         let world_z = chunk_z * CHUNK_SIZE as i32;
+
+        // Pre-compute structure blocks for this chunk region (O(n) once instead of O(n²) per block)
+        // We need to check spawn points in a radius around the chunk that could place blocks inside
+        let structure_blocks = self.precompute_structure_blocks(
+            world_x,
+            world_y,
+            world_z,
+            CHUNK_SIZE as i32,
+        );
 
         for local_x in 0..CHUNK_SIZE {
             for local_z in 0..CHUNK_SIZE {
@@ -83,7 +186,9 @@ impl WorldGenerator {
 
                 for local_y in 0..CHUNK_SIZE {
                     let wy = world_y + local_y as i32;
-                    let block = self.get_block_at(wx, wy, wz, height, &biome);
+                    let block = self.get_block_at_with_structures(
+                        wx, wy, wz, height, &biome, &structure_blocks
+                    );
                     chunk.set_block(local_x, local_y, local_z, block);
                 }
             }
@@ -100,21 +205,31 @@ impl WorldGenerator {
         self.config.sea_level + (normalized * self.config.terrain_height) as i32
     }
 
-    fn get_biome(&self, x: i32, z: i32) -> Biome {
-        let temperature = self.biome_noise.get([x as f64 * 0.005, z as f64 * 0.005]);
-        let moisture =
-            self.biome_noise
-                .get([x as f64 * 0.005 + 1000.0, z as f64 * 0.005 + 1000.0]);
+    fn get_biome(&self, x: i32, z: i32) -> &CompiledBiome {
+        let scale = self.biomes_config.biome_scale;
+        let temperature = self.biome_noise.get([x as f64 * scale, z as f64 * scale]);
+        let moisture = self
+            .biome_noise
+            .get([x as f64 * scale + 1000.0, z as f64 * scale + 1000.0]);
 
-        match (temperature > 0.0, moisture > 0.0) {
-            (true, true) => Biome::Forest,
-            (true, false) => Biome::Desert,
-            (false, true) => Biome::Plains,
-            (false, false) => Biome::Mountains,
+        // Find the first biome that matches the temperature/moisture ranges
+        for biome in &self.biomes_config.biomes {
+            if temperature >= biome.temperature_min
+                && temperature < biome.temperature_max
+                && moisture >= biome.moisture_min
+                && moisture < biome.moisture_max
+            {
+                return biome;
+            }
         }
+
+        // Fallback to first biome if none match (shouldn't happen with proper config)
+        &self.biomes_config.biomes[0]
     }
 
-    fn get_block_at(&self, x: i32, y: i32, z: i32, surface_height: i32, biome: &Biome) -> BlockType {
+    /// Get block at position (legacy method without structure support)
+    #[allow(dead_code)]
+    fn get_block_at(&self, x: i32, y: i32, z: i32, surface_height: i32, biome: &CompiledBiome) -> BlockType {
         if y > surface_height {
             if y <= self.config.sea_level {
                 return BlockType::Water;
@@ -126,25 +241,20 @@ impl WorldGenerator {
             return BlockType::Air;
         }
 
+        // Surface block
         if y == surface_height {
-            return match biome {
-                Biome::Desert => BlockType::Sand,
-                Biome::Forest | Biome::Plains => BlockType::Grass,
-                Biome::Mountains => {
-                    if y > self.config.sea_level + 20 {
-                        BlockType::Stone
-                    } else {
-                        BlockType::Grass
-                    }
+            // Check if we're above the stone altitude threshold
+            if let Some(stone_alt) = biome.stone_altitude {
+                if y > self.config.sea_level + stone_alt {
+                    return BlockType::Stone;
                 }
-            };
+            }
+            return biome.surface_block;
         }
 
+        // Subsurface (up to 4 blocks deep)
         if y > surface_height - 4 {
-            return match biome {
-                Biome::Desert => BlockType::Sand,
-                _ => BlockType::Dirt,
-            };
+            return biome.subsurface_block;
         }
 
         if let Some(ore) = self.get_ore(x, y, z) {
@@ -205,15 +315,167 @@ impl WorldGenerator {
 
         None
     }
+
+    /// Check if a structure spawns at the given world position
+    /// Returns the structure type if one spawns there
+    fn get_structure_at(&self, x: i32, z: i32, biome: &CompiledBiome, surface_height: i32) -> Option<StructureType> {
+        // Don't spawn structures underwater
+        if surface_height <= self.config.sea_level {
+            return None;
+        }
+
+        let hash = structure_hash(x, z, self.config.seed);
+
+        // Check biome-specific structures
+        match biome.name.as_str() {
+            "forest" => {
+                // Higher tree density in forests (hash < 8 = ~3% chance)
+                if hash < 8 {
+                    return Some(StructureType::OakTree);
+                }
+            }
+            "plains" => {
+                // Lower tree density in plains (hash < 2 = ~0.8% chance)
+                if hash < 2 {
+                    return Some(StructureType::OakTree);
+                }
+            }
+            "desert" => {
+                // Cacti in deserts (hash < 4 = ~1.5% chance)
+                if hash < 4 {
+                    return Some(StructureType::Cactus);
+                }
+            }
+            _ => {}
+        }
+
+        None
+    }
+
+    /// Pre-compute all structure blocks that fall within a chunk region
+    /// This is called once per chunk instead of per-block for O(1) lookup
+    fn precompute_structure_blocks(
+        &self,
+        chunk_world_x: i32,
+        chunk_world_y: i32,
+        chunk_world_z: i32,
+        chunk_size: i32,
+    ) -> HashMap<(i32, i32, i32), BlockType> {
+        let mut structure_blocks = HashMap::new();
+
+        // Maximum structure height (oak tree is tallest at 7 blocks)
+        const MAX_STRUCTURE_HEIGHT: i32 = 7;
+
+        // Check spawn points in a region that could place blocks inside this chunk
+        // We need to check spawn points outside the chunk that could have structures
+        // reaching into our chunk
+        let min_x = chunk_world_x - STRUCTURE_CHECK_RADIUS;
+        let max_x = chunk_world_x + chunk_size + STRUCTURE_CHECK_RADIUS;
+        let min_z = chunk_world_z - STRUCTURE_CHECK_RADIUS;
+        let max_z = chunk_world_z + chunk_size + STRUCTURE_CHECK_RADIUS;
+
+        for sx in min_x..max_x {
+            for sz in min_z..max_z {
+                // Get biome and height for this potential spawn point
+                let biome = self.get_biome(sx, sz);
+                let surface_height = self.get_terrain_height(sx, sz);
+
+                // Check if a structure spawns here
+                if let Some(structure_type) = self.get_structure_at(sx, sz, biome, surface_height) {
+                    let spawn_y = surface_height + 1;
+
+                    // Only process if structure could reach into our chunk's Y range
+                    if spawn_y + MAX_STRUCTURE_HEIGHT < chunk_world_y
+                        || spawn_y >= chunk_world_y + chunk_size
+                    {
+                        continue;
+                    }
+
+                    // Add all blocks from this structure that fall within our chunk
+                    let blocks = get_structure_blocks(structure_type);
+                    for block in blocks {
+                        let bx = sx + block.dx;
+                        let by = spawn_y + block.dy;
+                        let bz = sz + block.dz;
+
+                        // Check if this block is within our chunk bounds
+                        if bx >= chunk_world_x
+                            && bx < chunk_world_x + chunk_size
+                            && by >= chunk_world_y
+                            && by < chunk_world_y + chunk_size
+                            && bz >= chunk_world_z
+                            && bz < chunk_world_z + chunk_size
+                        {
+                            structure_blocks.insert((bx, by, bz), block.block);
+                        }
+                    }
+                }
+            }
+        }
+
+        structure_blocks
+    }
+
+    /// Get block at position using pre-computed structure blocks (O(1) lookup)
+    fn get_block_at_with_structures(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+        surface_height: i32,
+        biome: &CompiledBiome,
+        structure_blocks: &HashMap<(i32, i32, i32), BlockType>,
+    ) -> BlockType {
+        // Check for structures first (they can be above ground)
+        if y > surface_height {
+            // O(1) lookup instead of O(n²) search
+            if let Some(&block) = structure_blocks.get(&(x, y, z)) {
+                return block;
+            }
+
+            if y <= self.config.sea_level {
+                return BlockType::Water;
+            }
+            return BlockType::Air;
+        }
+
+        if self.is_cave(x, y, z) && y < surface_height - 1 {
+            return BlockType::Air;
+        }
+
+        // Surface block
+        if y == surface_height {
+            // Check if we're above the stone altitude threshold
+            if let Some(stone_alt) = biome.stone_altitude {
+                if y > self.config.sea_level + stone_alt {
+                    return BlockType::Stone;
+                }
+            }
+            return biome.surface_block;
+        }
+
+        // Subsurface (up to 4 blocks deep)
+        if y > surface_height - 4 {
+            return biome.subsurface_block;
+        }
+
+        if let Some(ore) = self.get_ore(x, y, z) {
+            return ore;
+        }
+
+        if y < 10 {
+            let bedrock_noise =
+                self.ore_noise
+                    .get([x as f64 * 0.5, y as f64 * 0.5, z as f64 * 0.5]);
+            if bedrock_noise > 0.3 + (y as f64 * 0.05) {
+                return BlockType::Cobblestone;
+            }
+        }
+
+        BlockType::Stone
+    }
 }
 
-#[derive(Clone, Copy, Debug)]
-enum Biome {
-    Plains,
-    Forest,
-    Desert,
-    Mountains,
-}
 
 /// Manages multiple chunks with HashMap storage for O(1) neighbor lookup
 pub struct World {
@@ -235,6 +497,8 @@ pub struct World {
     mesh_dirty: bool,
     /// Pre-allocated set for desired chunk positions (reused each frame)
     desired_chunks: HashSet<ChunkPos>,
+    /// Biomes configuration
+    biomes_config: CompiledBiomesConfig,
 }
 
 impl World {
@@ -247,12 +511,18 @@ impl World {
             seed,
             ..Default::default()
         };
+        let biomes_config = CompiledBiomesConfig::default();
 
-        Self::with_world_gen_config(config, render_distance, height_chunks)
+        Self::with_world_gen_config(config, biomes_config, render_distance, height_chunks)
     }
 
     /// Create a new world with terrain configuration from config file
-    pub fn with_config(terrain_config: &TerrainConfig, render_distance: i32, height_chunks: i32) -> Self {
+    pub fn with_config(
+        terrain_config: &TerrainConfig,
+        biomes_config: CompiledBiomesConfig,
+        render_distance: i32,
+        height_chunks: i32,
+    ) -> Self {
         let config = WorldGenConfig {
             seed: terrain_config.seed,
             sea_level: terrain_config.sea_level,
@@ -262,10 +532,15 @@ impl World {
             cave_threshold: terrain_config.cave_threshold,
         };
 
-        Self::with_world_gen_config(config, render_distance, height_chunks)
+        Self::with_world_gen_config(config, biomes_config, render_distance, height_chunks)
     }
 
-    fn with_world_gen_config(config: WorldGenConfig, render_distance: i32, height_chunks: i32) -> Self {
+    fn with_world_gen_config(
+        config: WorldGenConfig,
+        biomes_config: CompiledBiomesConfig,
+        render_distance: i32,
+        height_chunks: i32,
+    ) -> Self {
         // Pre-allocate mesh buffers based on expected size
         // Rough estimate: ~500k vertices, ~750k indices for a typical view
         let estimated_vertices = 500_000;
@@ -277,7 +552,7 @@ impl World {
 
         Self {
             chunks: HashMap::with_capacity(max_chunks),
-            generator: WorldGenerator::new(config),
+            generator: WorldGenerator::new(config, biomes_config.clone()),
             render_distance,
             height_chunks,
             chunks_needing_remesh: Vec::new(),
@@ -286,6 +561,7 @@ impl World {
             mesh_indices: Vec::with_capacity(estimated_indices),
             mesh_dirty: true,
             desired_chunks: HashSet::with_capacity(max_chunks),
+            biomes_config,
         }
     }
 

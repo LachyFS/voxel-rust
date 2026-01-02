@@ -66,6 +66,34 @@ impl BlockType {
         matches!(self, BlockType::Air | BlockType::Water | BlockType::Leaves)
     }
 
+    /// Determine if a face should be rendered between current block and adjacent block
+    /// For opaque blocks: render if adjacent is not solid OR adjacent is transparent (visible through it)
+    /// For transparent blocks: render if adjacent is different type (prevents self-culling but shows all other faces)
+    #[inline]
+    pub fn should_render_face_against(&self, adjacent: BlockType) -> bool {
+        // Air doesn't render faces
+        if *self == BlockType::Air {
+            return false;
+        }
+
+        // Always render against air
+        if adjacent == BlockType::Air {
+            return true;
+        }
+
+        // For transparent blocks, render unless adjacent is the same type
+        // This prevents z-fighting between identical transparent blocks
+        // but ensures we see through leaves to the world beyond
+        if self.is_transparent() {
+            return *self != adjacent;
+        }
+
+        // For opaque blocks, render if:
+        // 1. Adjacent is not solid (air) - already handled above
+        // 2. Adjacent is transparent (so we can see this block through the transparent one)
+        adjacent.is_transparent()
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             BlockType::Air => "air",
@@ -90,9 +118,10 @@ impl Default for BlockType {
 
 pub const CHUNK_SIZE: usize = 16;
 
-/// A 2D slice of block solidity data for a chunk boundary face
+/// A 2D slice of block type data for a chunk boundary face
 /// Used for parallel mesh generation where we can't hold chunk references
-pub type BoundarySlice = [[bool; CHUNK_SIZE]; CHUNK_SIZE];
+/// Stores actual BlockType to support transparent block rendering decisions
+pub type BoundarySlice = [[BlockType; CHUNK_SIZE]; CHUNK_SIZE];
 
 /// Extracted boundary data from neighboring chunks for parallel mesh generation
 #[derive(Clone)]
@@ -130,15 +159,26 @@ pub struct BoundaryNeighbors<'a> {
 }
 
 impl<'a> BoundaryNeighbors<'a> {
-    /// Check if block at neighbor boundary position is solid
-    fn is_solid_at(&self, dir: Face, local_x: usize, local_y: usize, local_z: usize) -> bool {
+    /// Get the block type at neighbor boundary position
+    /// Returns None if neighbor chunk doesn't exist (treat as solid for culling)
+    fn get_block_at(&self, dir: Face, local_x: usize, local_y: usize, local_z: usize) -> Option<BlockType> {
         match dir {
-            Face::Right => self.pos_x.map(|b| b[local_y][local_z]).unwrap_or(true),
-            Face::Left => self.neg_x.map(|b| b[local_y][local_z]).unwrap_or(true),
-            Face::Top => self.pos_y.map(|b| b[local_x][local_z]).unwrap_or(true),
-            Face::Bottom => self.neg_y.map(|b| b[local_x][local_z]).unwrap_or(true),
-            Face::Front => self.pos_z.map(|b| b[local_x][local_y]).unwrap_or(true),
-            Face::Back => self.neg_z.map(|b| b[local_x][local_y]).unwrap_or(true),
+            Face::Right => self.pos_x.map(|b| b[local_y][local_z]),
+            Face::Left => self.neg_x.map(|b| b[local_y][local_z]),
+            Face::Top => self.pos_y.map(|b| b[local_x][local_z]),
+            Face::Bottom => self.neg_y.map(|b| b[local_x][local_z]),
+            Face::Front => self.pos_z.map(|b| b[local_x][local_y]),
+            Face::Back => self.neg_z.map(|b| b[local_x][local_y]),
+        }
+    }
+
+    /// Check if face should render against neighbor boundary
+    /// current_block: the block we're rendering
+    fn should_render_face(&self, current_block: BlockType, dir: Face, local_x: usize, local_y: usize, local_z: usize) -> bool {
+        match self.get_block_at(dir, local_x, local_y, local_z) {
+            Some(adjacent) => current_block.should_render_face_against(adjacent),
+            // No neighbor chunk loaded - don't render to avoid seams
+            None => false,
         }
     }
 }
@@ -155,46 +195,43 @@ pub struct ChunkNeighbors<'a> {
 }
 
 impl<'a> ChunkNeighbors<'a> {
-    /// Check if block at neighbor position is solid
-    /// Returns true (solid) if neighbor doesn't exist - skip rendering until neighbor loads
-    fn is_solid_at(&self, dir: Face, local_x: usize, local_y: usize, local_z: usize) -> bool {
+    /// Get block type at neighbor position
+    /// Returns None if neighbor doesn't exist
+    fn get_block_at(&self, dir: Face, local_x: usize, local_y: usize, local_z: usize) -> Option<BlockType> {
         match dir {
             Face::Right => {
                 // +X: check neg_x face of pos_x neighbor
-                self.pos_x
-                    .map(|c| c.blocks[0][local_y][local_z].is_solid())
-                    .unwrap_or(true)
+                self.pos_x.map(|c| c.blocks[0][local_y][local_z])
             }
             Face::Left => {
                 // -X: check pos_x face of neg_x neighbor
-                self.neg_x
-                    .map(|c| c.blocks[CHUNK_SIZE - 1][local_y][local_z].is_solid())
-                    .unwrap_or(true)
+                self.neg_x.map(|c| c.blocks[CHUNK_SIZE - 1][local_y][local_z])
             }
             Face::Top => {
                 // +Y: check neg_y face of pos_y neighbor
-                self.pos_y
-                    .map(|c| c.blocks[local_x][0][local_z].is_solid())
-                    .unwrap_or(true)
+                self.pos_y.map(|c| c.blocks[local_x][0][local_z])
             }
             Face::Bottom => {
                 // -Y: check pos_y face of neg_y neighbor
-                self.neg_y
-                    .map(|c| c.blocks[local_x][CHUNK_SIZE - 1][local_z].is_solid())
-                    .unwrap_or(true)
+                self.neg_y.map(|c| c.blocks[local_x][CHUNK_SIZE - 1][local_z])
             }
             Face::Front => {
                 // +Z: check neg_z face of pos_z neighbor
-                self.pos_z
-                    .map(|c| c.blocks[local_x][local_y][0].is_solid())
-                    .unwrap_or(true)
+                self.pos_z.map(|c| c.blocks[local_x][local_y][0])
             }
             Face::Back => {
                 // -Z: check pos_z face of neg_z neighbor
-                self.neg_z
-                    .map(|c| c.blocks[local_x][local_y][CHUNK_SIZE - 1].is_solid())
-                    .unwrap_or(true)
+                self.neg_z.map(|c| c.blocks[local_x][local_y][CHUNK_SIZE - 1])
             }
+        }
+    }
+
+    /// Check if face should render against neighbor chunk
+    fn should_render_face(&self, current_block: BlockType, dir: Face, local_x: usize, local_y: usize, local_z: usize) -> bool {
+        match self.get_block_at(dir, local_x, local_y, local_z) {
+            Some(adjacent) => current_block.should_render_face_against(adjacent),
+            // No neighbor chunk loaded - don't render to avoid seams
+            None => false,
         }
     }
 }
@@ -259,69 +296,69 @@ impl Chunk {
         }
     }
 
-    /// Extract the +X boundary (x = CHUNK_SIZE-1) as a 2D slice of solidity
+    /// Extract the +X boundary (x = CHUNK_SIZE-1) as a 2D slice of block types
     /// Used by -X neighbor to check if faces should render
     pub fn extract_pos_x_boundary(&self) -> BoundarySlice {
-        let mut slice = [[false; CHUNK_SIZE]; CHUNK_SIZE];
+        let mut slice = [[BlockType::Air; CHUNK_SIZE]; CHUNK_SIZE];
         for y in 0..CHUNK_SIZE {
             for z in 0..CHUNK_SIZE {
-                slice[y][z] = self.blocks[CHUNK_SIZE - 1][y][z].is_solid();
+                slice[y][z] = self.blocks[CHUNK_SIZE - 1][y][z];
             }
         }
         slice
     }
 
-    /// Extract the -X boundary (x = 0) as a 2D slice of solidity
+    /// Extract the -X boundary (x = 0) as a 2D slice of block types
     /// Used by +X neighbor to check if faces should render
     pub fn extract_neg_x_boundary(&self) -> BoundarySlice {
-        let mut slice = [[false; CHUNK_SIZE]; CHUNK_SIZE];
+        let mut slice = [[BlockType::Air; CHUNK_SIZE]; CHUNK_SIZE];
         for y in 0..CHUNK_SIZE {
             for z in 0..CHUNK_SIZE {
-                slice[y][z] = self.blocks[0][y][z].is_solid();
+                slice[y][z] = self.blocks[0][y][z];
             }
         }
         slice
     }
 
-    /// Extract the +Y boundary (y = CHUNK_SIZE-1) as a 2D slice of solidity
+    /// Extract the +Y boundary (y = CHUNK_SIZE-1) as a 2D slice of block types
     pub fn extract_pos_y_boundary(&self) -> BoundarySlice {
-        let mut slice = [[false; CHUNK_SIZE]; CHUNK_SIZE];
+        let mut slice = [[BlockType::Air; CHUNK_SIZE]; CHUNK_SIZE];
         for x in 0..CHUNK_SIZE {
             for z in 0..CHUNK_SIZE {
-                slice[x][z] = self.blocks[x][CHUNK_SIZE - 1][z].is_solid();
+                slice[x][z] = self.blocks[x][CHUNK_SIZE - 1][z];
             }
         }
         slice
     }
 
-    /// Extract the -Y boundary (y = 0) as a 2D slice of solidity
+    /// Extract the -Y boundary (y = 0) as a 2D slice of block types
     pub fn extract_neg_y_boundary(&self) -> BoundarySlice {
-        let mut slice = [[false; CHUNK_SIZE]; CHUNK_SIZE];
+        let mut slice = [[BlockType::Air; CHUNK_SIZE]; CHUNK_SIZE];
         for x in 0..CHUNK_SIZE {
             for z in 0..CHUNK_SIZE {
-                slice[x][z] = self.blocks[x][0][z].is_solid();
+                slice[x][z] = self.blocks[x][0][z];
             }
         }
         slice
     }
 
-    /// Extract the +Z boundary (z = CHUNK_SIZE-1) as a 2D slice of solidity
+    /// Extract the +Z boundary (z = CHUNK_SIZE-1) as a 2D slice of block types
     pub fn extract_pos_z_boundary(&self) -> BoundarySlice {
-        let mut slice = [[false; CHUNK_SIZE]; CHUNK_SIZE];
+        let mut slice = [[BlockType::Air; CHUNK_SIZE]; CHUNK_SIZE];
         for x in 0..CHUNK_SIZE {
             for y in 0..CHUNK_SIZE {
-                slice[x][y] = self.blocks[x][y][CHUNK_SIZE - 1].is_solid();
+                slice[x][y] = self.blocks[x][y][CHUNK_SIZE - 1];
             }
         }
         slice
     }
 
-    /// Extract the -Z boundary (z = 0) as a 2D slice of solidity
+    /// Extract the -Z boundary (z = 0) as a 2D slice of block types
     pub fn extract_neg_z_boundary(&self) -> BoundarySlice {
-        let mut slice = [[false; CHUNK_SIZE]; CHUNK_SIZE];
+        let mut slice = [[BlockType::Air; CHUNK_SIZE]; CHUNK_SIZE];
         for x in 0..CHUNK_SIZE {
             for y in 0..CHUNK_SIZE {
-                slice[x][y] = self.blocks[x][y][0].is_solid();
+                slice[x][y] = self.blocks[x][y][0];
             }
         }
         slice
@@ -362,7 +399,7 @@ impl Chunk {
                 if x == CHUNK_SIZE - 1 {
                     None // boundary case handled separately
                 } else {
-                    Some(!blocks[x + 1][y][z].is_solid())
+                    Some(blocks[x + 1][y][z])
                 }
             },
             |tex| tex.sides,
@@ -379,7 +416,7 @@ impl Chunk {
                 if x == 0 {
                     None
                 } else {
-                    Some(!blocks[x - 1][y][z].is_solid())
+                    Some(blocks[x - 1][y][z])
                 }
             },
             |tex| tex.sides,
@@ -396,7 +433,7 @@ impl Chunk {
                 if y == CHUNK_SIZE - 1 {
                     None
                 } else {
-                    Some(!blocks[x][y + 1][z].is_solid())
+                    Some(blocks[x][y + 1][z])
                 }
             },
             |tex| tex.top,
@@ -413,7 +450,7 @@ impl Chunk {
                 if y == 0 {
                     None
                 } else {
-                    Some(!blocks[x][y - 1][z].is_solid())
+                    Some(blocks[x][y - 1][z])
                 }
             },
             |tex| tex.bottom,
@@ -430,7 +467,7 @@ impl Chunk {
                 if z == CHUNK_SIZE - 1 {
                     None
                 } else {
-                    Some(!blocks[x][y][z + 1].is_solid())
+                    Some(blocks[x][y][z + 1])
                 }
             },
             |tex| tex.sides,
@@ -447,7 +484,7 @@ impl Chunk {
                 if z == 0 {
                     None
                 } else {
-                    Some(!blocks[x][y][z - 1].is_solid())
+                    Some(blocks[x][y][z - 1])
                 }
             },
             |tex| tex.sides,
@@ -464,11 +501,12 @@ impl Chunk {
         chunk_offset: Vec3,
         face: Face,
         coord_mapper: F,
-        should_render_internal: G,
+        get_adjacent_internal: G,
         get_texture: T,
     ) where
         F: Fn(usize, usize, usize) -> (usize, usize, usize),
-        G: Fn(&[[[BlockType; CHUNK_SIZE]; CHUNK_SIZE]; CHUNK_SIZE], usize, usize, usize) -> Option<bool>,
+        // Returns None for boundary case, Some(adjacent_block) for internal
+        G: Fn(&[[[BlockType; CHUNK_SIZE]; CHUNK_SIZE]; CHUNK_SIZE], usize, usize, usize) -> Option<BlockType>,
         T: Fn(&crate::texture::BlockTextureIndices) -> u32,
     {
         // Mask stores texture layer for each cell, 0 means no face
@@ -488,10 +526,10 @@ impl Chunk {
                         continue;
                     }
 
-                    // Check if face should render
-                    let should_render = match should_render_internal(&self.blocks, x, y, z) {
-                        Some(result) => result,
-                        None => !neighbors.is_solid_at(face, x, y, z), // boundary case
+                    // Check if face should render using proper transparent block handling
+                    let should_render = match get_adjacent_internal(&self.blocks, x, y, z) {
+                        Some(adjacent) => block.should_render_face_against(adjacent),
+                        None => neighbors.should_render_face(block, face, x, y, z), // boundary case
                     };
 
                     if should_render {
@@ -599,9 +637,9 @@ impl Chunk {
 
                     // +X face (Right)
                     let should_render_pos_x = if x == CHUNK_SIZE - 1 {
-                        !neighbors.is_solid_at(Face::Right, x, y, z)
+                        neighbors.should_render_face(block, Face::Right, x, y, z)
                     } else {
-                        !self.blocks[x + 1][y][z].is_solid()
+                        block.should_render_face_against(self.blocks[x + 1][y][z])
                     };
                     if should_render_pos_x {
                         add_face(&mut self.mesh.vertices, &mut self.mesh.indices, pos, tex.sides, Face::Right);
@@ -609,9 +647,9 @@ impl Chunk {
 
                     // -X face (Left)
                     let should_render_neg_x = if x == 0 {
-                        !neighbors.is_solid_at(Face::Left, x, y, z)
+                        neighbors.should_render_face(block, Face::Left, x, y, z)
                     } else {
-                        !self.blocks[x - 1][y][z].is_solid()
+                        block.should_render_face_against(self.blocks[x - 1][y][z])
                     };
                     if should_render_neg_x {
                         add_face(&mut self.mesh.vertices, &mut self.mesh.indices, pos, tex.sides, Face::Left);
@@ -619,9 +657,9 @@ impl Chunk {
 
                     // +Y face (Top)
                     let should_render_pos_y = if y == CHUNK_SIZE - 1 {
-                        !neighbors.is_solid_at(Face::Top, x, y, z)
+                        neighbors.should_render_face(block, Face::Top, x, y, z)
                     } else {
-                        !self.blocks[x][y + 1][z].is_solid()
+                        block.should_render_face_against(self.blocks[x][y + 1][z])
                     };
                     if should_render_pos_y {
                         add_face(&mut self.mesh.vertices, &mut self.mesh.indices, pos, tex.top, Face::Top);
@@ -629,9 +667,9 @@ impl Chunk {
 
                     // -Y face (Bottom)
                     let should_render_neg_y = if y == 0 {
-                        !neighbors.is_solid_at(Face::Bottom, x, y, z)
+                        neighbors.should_render_face(block, Face::Bottom, x, y, z)
                     } else {
-                        !self.blocks[x][y - 1][z].is_solid()
+                        block.should_render_face_against(self.blocks[x][y - 1][z])
                     };
                     if should_render_neg_y {
                         add_face(&mut self.mesh.vertices, &mut self.mesh.indices, pos, tex.bottom, Face::Bottom);
@@ -639,9 +677,9 @@ impl Chunk {
 
                     // +Z face (Front)
                     let should_render_pos_z = if z == CHUNK_SIZE - 1 {
-                        !neighbors.is_solid_at(Face::Front, x, y, z)
+                        neighbors.should_render_face(block, Face::Front, x, y, z)
                     } else {
-                        !self.blocks[x][y][z + 1].is_solid()
+                        block.should_render_face_against(self.blocks[x][y][z + 1])
                     };
                     if should_render_pos_z {
                         add_face(&mut self.mesh.vertices, &mut self.mesh.indices, pos, tex.sides, Face::Front);
@@ -649,9 +687,9 @@ impl Chunk {
 
                     // -Z face (Back)
                     let should_render_neg_z = if z == 0 {
-                        !neighbors.is_solid_at(Face::Back, x, y, z)
+                        neighbors.should_render_face(block, Face::Back, x, y, z)
                     } else {
-                        !self.blocks[x][y][z - 1].is_solid()
+                        block.should_render_face_against(self.blocks[x][y][z - 1])
                     };
                     if should_render_neg_z {
                         add_face(&mut self.mesh.vertices, &mut self.mesh.indices, pos, tex.sides, Face::Back);

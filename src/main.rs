@@ -15,7 +15,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
 use camera::{Camera, CameraController};
-use config::Config;
+use config::{CompiledBiomesConfig, Config};
 use renderer::Renderer;
 use texture::TextureManager;
 use worldgen::World;
@@ -105,8 +105,10 @@ impl ApplicationHandler for App {
             // Create world with config values
             let render_distance = self.config.rendering.render_distance;
             let height_chunks = self.config.rendering.height_chunks;
+            let biomes_config = CompiledBiomesConfig::load(Path::new("assets/biomes.toml"));
             let mut world = World::with_config(
                 &self.config.terrain,
+                biomes_config,
                 render_distance,
                 height_chunks,
             );
