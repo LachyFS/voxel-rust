@@ -2,6 +2,12 @@
 name = "voxel-rust"
 version = "0.1.0"
 edition = "2021"
+default-run = "voxel-rust"
+
+[features]
+default = []
+# Embed all assets (config, textures) into the binary for standalone release builds
+embed-assets = []
 
 [dependencies]
 wgpu = "23"

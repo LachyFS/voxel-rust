@@ -57,7 +57,43 @@ impl TextureManager {
     pub fn load(textures_dir: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let config_path = textures_dir.join("textures.toml");
         let config_str = fs::read_to_string(&config_path)?;
-        let config: TextureConfig = toml::from_str(&config_str)?;
+
+        Self::load_with_file_reader(&config_str, |filename| {
+            let path = textures_dir.join(filename);
+            let img = image::open(&path)?;
+            Ok(img.to_rgba8().into_raw())
+        })
+    }
+
+    /// Load textures from embedded assets (for standalone release builds)
+    #[cfg(feature = "embed-assets")]
+    pub fn load_embedded() -> Result<Self, Box<dyn std::error::Error>> {
+        use crate::embedded_assets::{EMBEDDED_TEXTURES, TEXTURES_TOML};
+        use std::io::Cursor;
+
+        // Build a lookup map from filename to embedded data
+        let texture_map: HashMap<&str, &[u8]> = EMBEDDED_TEXTURES
+            .iter()
+            .map(|t| (t.name, t.data))
+            .collect();
+
+        Self::load_with_file_reader(TEXTURES_TOML, |filename| {
+            let data = texture_map
+                .get(filename)
+                .ok_or_else(|| format!("Embedded texture not found: {}", filename))?;
+            let img = image::load(Cursor::new(*data), image::ImageFormat::Png)?;
+            Ok(img.to_rgba8().into_raw())
+        })
+    }
+
+    fn load_with_file_reader<F>(
+        config_str: &str,
+        mut read_texture: F,
+    ) -> Result<Self, Box<dyn std::error::Error>>
+    where
+        F: FnMut(&str) -> Result<Vec<u8>, Box<dyn std::error::Error>>,
+    {
+        let config: TextureConfig = toml::from_str(config_str)?;
 
         let mut texture_indices: HashMap<String, u32> = HashMap::new();
         let mut texture_data: Vec<u8> = Vec::new();
@@ -81,23 +117,22 @@ impl TextureManager {
 
         // Load each unique texture
         for filename in &unique_files {
-            let path = textures_dir.join(filename);
-            let img = image::open(&path)?;
-            let rgba = img.to_rgba8();
+            let rgba_data = read_texture(filename)?;
+            let expected_size = (TEXTURE_SIZE * TEXTURE_SIZE * 4) as usize;
 
-            if img.width() != TEXTURE_SIZE || img.height() != TEXTURE_SIZE {
+            if rgba_data.len() != expected_size {
                 return Err(format!(
-                    "Texture {} is {}x{}, expected {}x{}",
+                    "Texture {} has wrong size: {} bytes, expected {} bytes ({}x{})",
                     filename,
-                    img.width(),
-                    img.height(),
+                    rgba_data.len(),
+                    expected_size,
                     TEXTURE_SIZE,
                     TEXTURE_SIZE
                 )
                 .into());
             }
 
-            texture_data.extend_from_slice(&rgba);
+            texture_data.extend_from_slice(&rgba_data);
             texture_indices.insert(filename.clone(), current_index);
             current_index += 1;
         }

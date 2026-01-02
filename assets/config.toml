@@ -5,8 +5,8 @@
 # Higher values = more visible terrain, but more memory and GPU usage
 render_distance = 10
 
-# Vertical render distance in chunks
-height_chunks = 6
+# Vertical render distance in chunks (16 blocks each, 24 = 384 blocks like Minecraft)
+height_chunks = 8
 
 [terrain]
 # World generation seed (same seed = same world)
@@ -28,6 +28,9 @@ cave_scale = 0.08
 cave_threshold = 0.55
 
 [camera]
+# Field of view in degrees
+fov = 70.0
+
 # Movement speed (blocks per second)
 movement_speed = 20.0
 

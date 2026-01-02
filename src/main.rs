@@ -1,5 +1,7 @@
 mod camera;
 mod config;
+#[cfg(feature = "embed-assets")]
+mod embedded_assets;
 mod renderer;
 mod texture;
 mod voxel;
@@ -38,9 +40,21 @@ struct App {
 impl App {
     fn new() -> Self {
         // Load configuration
+        #[cfg(feature = "embed-assets")]
+        let config = Config::load_embedded();
+        #[cfg(not(feature = "embed-assets"))]
         let config = Config::load(Path::new("assets/config.toml"));
 
         // Load textures before window creation
+        #[cfg(feature = "embed-assets")]
+        let texture_manager = match TextureManager::load_embedded() {
+            Ok(tm) => Some(tm),
+            Err(e) => {
+                log::error!("Failed to load embedded textures: {}", e);
+                None
+            }
+        };
+        #[cfg(not(feature = "embed-assets"))]
         let texture_manager = match TextureManager::load(Path::new("assets/textures")) {
             Ok(tm) => Some(tm),
             Err(e) => {
@@ -89,7 +103,7 @@ impl ApplicationHandler for App {
             let aspect = size.width as f32 / size.height as f32;
 
             // Create camera positioned above the terrain (using config values)
-            let mut camera = Camera::new(aspect);
+            let mut camera = Camera::new(aspect, self.config.camera.fov);
             camera.position = glam::Vec3::new(
                 self.config.camera.start_x,
                 self.config.camera.start_y,
@@ -105,6 +119,9 @@ impl ApplicationHandler for App {
             // Create world with config values
             let render_distance = self.config.rendering.render_distance;
             let height_chunks = self.config.rendering.height_chunks;
+            #[cfg(feature = "embed-assets")]
+            let biomes_config = CompiledBiomesConfig::load_embedded();
+            #[cfg(not(feature = "embed-assets"))]
             let biomes_config = CompiledBiomesConfig::load(Path::new("assets/biomes.toml"));
             let mut world = World::with_config(
                 &self.config.terrain,

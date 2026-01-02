@@ -38,6 +38,9 @@ pub struct TerrainConfig {
 
 #[derive(Debug, Deserialize)]
 pub struct CameraConfig {
+    /// Field of view in degrees
+    #[serde(default = "default_fov")]
+    pub fov: f32,
     /// Movement speed in blocks per second
     pub movement_speed: f32,
     /// Mouse sensitivity
@@ -50,6 +53,10 @@ pub struct CameraConfig {
     pub start_z: f32,
     /// Starting pitch in degrees
     pub start_pitch: f32,
+}
+
+fn default_fov() -> f32 {
+    70.0
 }
 
 impl Default for Config {
@@ -68,6 +75,7 @@ impl Default for Config {
                 cave_threshold: 0.55,
             },
             camera: CameraConfig {
+                fov: 90.0,
                 movement_speed: 20.0,
                 mouse_sensitivity: 0.003,
                 start_x: 32.0,
@@ -83,18 +91,29 @@ impl Config {
     /// Load configuration from a TOML file, falling back to defaults if not found
     pub fn load(path: &Path) -> Self {
         match fs::read_to_string(path) {
-            Ok(contents) => match toml::from_str(&contents) {
-                Ok(config) => {
-                    log::info!("Loaded configuration from {:?}", path);
-                    config
-                }
-                Err(e) => {
-                    log::warn!("Failed to parse config file: {}. Using defaults.", e);
-                    Self::default()
-                }
-            },
+            Ok(contents) => Self::from_str(&contents, path),
             Err(e) => {
                 log::warn!("Failed to read config file: {}. Using defaults.", e);
+                Self::default()
+            }
+        }
+    }
+
+    /// Load configuration from embedded string data
+    #[cfg(feature = "embed-assets")]
+    pub fn load_embedded() -> Self {
+        let contents = crate::embedded_assets::CONFIG_TOML;
+        Self::from_str(contents, Path::new("(embedded)"))
+    }
+
+    fn from_str(contents: &str, source: &Path) -> Self {
+        match toml::from_str(contents) {
+            Ok(config) => {
+                log::info!("Loaded configuration from {:?}", source);
+                config
+            }
+            Err(e) => {
+                log::warn!("Failed to parse config file: {}. Using defaults.", e);
                 Self::default()
             }
         }
@@ -305,19 +324,30 @@ impl CompiledBiomesConfig {
     /// Load biomes configuration from a TOML file
     pub fn load(path: &Path) -> Self {
         match fs::read_to_string(path) {
-            Ok(contents) => match toml::from_str::<BiomesConfig>(&contents) {
-                Ok(config) => {
-                    let compiled = Self::compile(config);
-                    log::info!("Loaded {} biomes from {:?}", compiled.biomes.len(), path);
-                    compiled
-                }
-                Err(e) => {
-                    log::warn!("Failed to parse biomes config: {}. Using defaults.", e);
-                    Self::default()
-                }
-            },
+            Ok(contents) => Self::from_str(&contents, path),
             Err(e) => {
                 log::warn!("Failed to read biomes config: {}. Using defaults.", e);
+                Self::default()
+            }
+        }
+    }
+
+    /// Load biomes configuration from embedded string data
+    #[cfg(feature = "embed-assets")]
+    pub fn load_embedded() -> Self {
+        let contents = crate::embedded_assets::BIOMES_TOML;
+        Self::from_str(contents, Path::new("(embedded)"))
+    }
+
+    fn from_str(contents: &str, source: &Path) -> Self {
+        match toml::from_str::<BiomesConfig>(contents) {
+            Ok(config) => {
+                let compiled = Self::compile(config);
+                log::info!("Loaded {} biomes from {:?}", compiled.biomes.len(), source);
+                compiled
+            }
+            Err(e) => {
+                log::warn!("Failed to parse biomes config: {}. Using defaults.", e);
                 Self::default()
             }
         }

@@ -175,15 +175,19 @@ fn calculate_buffer_sizes(render_distance: i32, height_chunks: i32) -> (u64, u64
     let vertex_buffer_size = num_chunks * vertices_per_chunk * vertex_size * 3 / 2;
     let index_buffer_size = num_chunks * indices_per_chunk * index_size * 3 / 2;
 
-    // Ensure minimum sizes and round up to power of 2 MB for alignment
+    // Ensure minimum sizes
     let min_vertex = 16 * 1024 * 1024; // 16 MB minimum
     let min_index = 8 * 1024 * 1024;   // 8 MB minimum
 
-    let vertex_buffer_size = vertex_buffer_size.max(min_vertex);
-    let index_buffer_size = index_buffer_size.max(min_index);
+    // GPU max buffer size is 256MB - cap initial allocation
+    // Buffers will grow dynamically if needed (up to 256MB)
+    let max_buffer_size: u64 = 256 * 1024 * 1024;
+
+    let vertex_buffer_size = vertex_buffer_size.max(min_vertex).min(max_buffer_size);
+    let index_buffer_size = index_buffer_size.max(min_index).min(max_buffer_size);
 
     log::info!(
-        "GPU buffer sizes for {} chunks: vertex={:.1}MB, index={:.1}MB",
+        "Initial GPU buffer sizes for {} chunks: vertex={:.1}MB, index={:.1}MB (will grow if needed)",
         num_chunks,
         vertex_buffer_size as f64 / (1024.0 * 1024.0),
         index_buffer_size as f64 / (1024.0 * 1024.0)
@@ -764,6 +768,50 @@ impl Renderer {
         format!("{:02}:{:02}", hour, minutes)
     }
 
+    /// Reallocate a buffer if needed, returning true if reallocation occurred
+    fn ensure_buffer_size(&mut self, buffer_idx: usize, needed_vertex_bytes: u64, needed_index_bytes: u64) {
+        // GPU max buffer size is 256MB
+        const MAX_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
+
+        let current_vertex_size = self.vertex_buffers[buffer_idx].size();
+        let current_index_size = self.index_buffers[buffer_idx].size();
+
+        // Check if we need to reallocate vertex buffer
+        if needed_vertex_bytes > current_vertex_size {
+            // Grow by 50% more than needed to avoid frequent reallocations
+            let new_size = ((needed_vertex_bytes * 3 / 2) as u64).min(MAX_BUFFER_SIZE);
+            log::info!(
+                "Reallocating vertex buffer {}: {}MB -> {}MB",
+                buffer_idx,
+                current_vertex_size / (1024 * 1024),
+                new_size / (1024 * 1024)
+            );
+            self.vertex_buffers[buffer_idx] = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("Vertex Buffer {}", buffer_idx)),
+                size: new_size,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+
+        // Check if we need to reallocate index buffer
+        if needed_index_bytes > current_index_size {
+            let new_size = ((needed_index_bytes * 3 / 2) as u64).min(MAX_BUFFER_SIZE);
+            log::info!(
+                "Reallocating index buffer {}: {}MB -> {}MB",
+                buffer_idx,
+                current_index_size / (1024 * 1024),
+                new_size / (1024 * 1024)
+            );
+            self.index_buffers[buffer_idx] = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("Index Buffer {}", buffer_idx)),
+                size: new_size,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+    }
+
     /// Update mesh from entire world with neighbor-aware culling and frustum culling
     /// Uses double-buffering to avoid GPU contention
     pub fn update_world(&mut self, world: &mut World, frustum: &Frustum) {
@@ -778,20 +826,21 @@ impl Renderer {
             // Write to the OTHER buffer (not the one being rendered)
             let write_buffer = 1 - self.current_buffer;
 
-            // Check buffer sizes
+            // Ensure buffers are large enough, reallocate if needed
+            self.ensure_buffer_size(write_buffer, vertex_bytes.len() as u64, index_bytes.len() as u64);
+
+            // Check if data fits (might not if we hit the 256MB limit)
             if vertex_bytes.len() as u64 > self.vertex_buffers[write_buffer].size() {
                 log::warn!(
-                    "Vertex buffer too small: need {} bytes, have {}",
-                    vertex_bytes.len(),
-                    self.vertex_buffers[write_buffer].size()
+                    "Vertex data ({:.1}MB) exceeds max buffer size (256MB) - some geometry will be clipped",
+                    vertex_bytes.len() as f64 / (1024.0 * 1024.0)
                 );
                 return;
             }
             if index_bytes.len() as u64 > self.index_buffers[write_buffer].size() {
                 log::warn!(
-                    "Index buffer too small: need {} bytes, have {}",
-                    index_bytes.len(),
-                    self.index_buffers[write_buffer].size()
+                    "Index data ({:.1}MB) exceeds max buffer size (256MB) - some geometry will be clipped",
+                    index_bytes.len() as f64 / (1024.0 * 1024.0)
                 );
                 return;
             }
