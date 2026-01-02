@@ -10,14 +10,16 @@ pub struct Vertex {
     pub uv: [f32; 2],
     pub normal: [f32; 3],
     pub tex_layer: u32,
+    pub ao: f32, // Ambient occlusion value (0.0 = fully occluded, 1.0 = no occlusion)
 }
 
 impl Vertex {
-    const ATTRIBS: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
+    const ATTRIBS: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
         0 => Float32x3,  // position
         1 => Float32x2,  // uv
         2 => Float32x3,  // normal
         3 => Uint32,     // tex_layer
+        4 => Float32,    // ao
     ];
 
     pub fn desc() -> wgpu::VertexBufferLayout<'static> {
@@ -494,6 +496,7 @@ impl Chunk {
     }
 
     /// Greedy mesh one face direction across all slices
+    /// Now includes AO-aware merging: only merges faces with identical AO patterns
     fn greedy_mesh_axis_with_boundaries<F, G, T>(
         &mut self,
         texture_indices: &BlockTextureArray,
@@ -509,10 +512,13 @@ impl Chunk {
         G: Fn(&[[[BlockType; CHUNK_SIZE]; CHUNK_SIZE]; CHUNK_SIZE], usize, usize, usize) -> Option<BlockType>,
         T: Fn(&crate::texture::BlockTextureIndices) -> u32,
     {
-        // Mask stores texture layer for each cell, 0 means no face
-        // We use u32::MAX as "no face" marker since 0 could be a valid texture
+        // Create AO sampler for this chunk
+        let ao_sampler = AoSampler::new(&self.blocks, neighbors);
+
+        // Mask stores (texture layer, ao_key) for each cell
+        // ao_key is a compact representation of the 4 AO values for merging decisions
         const NO_FACE: u32 = u32::MAX;
-        let mut mask = [[NO_FACE; CHUNK_SIZE]; CHUNK_SIZE];
+        let mut mask = [[(NO_FACE, 0u32); CHUNK_SIZE]; CHUNK_SIZE];
 
         for axis in 0..CHUNK_SIZE {
             // Build mask for this slice
@@ -522,7 +528,7 @@ impl Chunk {
                     let block = self.blocks[x][y][z];
 
                     if !block.is_solid() {
-                        mask[row][col] = NO_FACE;
+                        mask[row][col] = (NO_FACE, 0);
                         continue;
                     }
 
@@ -534,9 +540,17 @@ impl Chunk {
 
                     if should_render {
                         let tex = &texture_indices[block.as_index()];
-                        mask[row][col] = get_texture(tex);
+                        let tex_layer = get_texture(tex);
+
+                        // Calculate AO for this face and create a key for merging
+                        let ao = ao_sampler.calculate_face_ao(x as i32, y as i32, z as i32, face);
+                        // Pack AO values into a u32 key (4 values * 8 bits each)
+                        // This ensures faces only merge if they have identical AO
+                        let ao_key = ao_to_key(&ao);
+
+                        mask[row][col] = (tex_layer, ao_key);
                     } else {
-                        mask[row][col] = NO_FACE;
+                        mask[row][col] = (NO_FACE, 0);
                     }
                 }
             }
@@ -546,26 +560,26 @@ impl Chunk {
 
             for row in 0..CHUNK_SIZE {
                 for col in 0..CHUNK_SIZE {
-                    if processed[row][col] || mask[row][col] == NO_FACE {
+                    if processed[row][col] || mask[row][col].0 == NO_FACE {
                         continue;
                     }
 
-                    let tex_layer = mask[row][col];
+                    let (tex_layer, ao_key) = mask[row][col];
 
-                    // Find width (extend along col)
+                    // Find width (extend along col) - must match texture AND AO
                     let mut width = 1;
                     while col + width < CHUNK_SIZE
                         && !processed[row][col + width]
-                        && mask[row][col + width] == tex_layer
+                        && mask[row][col + width] == (tex_layer, ao_key)
                     {
                         width += 1;
                     }
 
-                    // Find height (extend along row)
+                    // Find height (extend along row) - must match texture AND AO
                     let mut height = 1;
                     'height: while row + height < CHUNK_SIZE {
                         for c in col..col + width {
-                            if processed[row + height][c] || mask[row + height][c] != tex_layer {
+                            if processed[row + height][c] || mask[row + height][c] != (tex_layer, ao_key) {
                                 break 'height;
                             }
                         }
@@ -587,6 +601,9 @@ impl Chunk {
                     let block = self.blocks[x][y][z];
                     let random_rotation = texture_indices[block.as_index()].random_rotation;
 
+                    // Get the AO values from the key (all merged faces have same AO)
+                    let ao_values = key_to_ao(ao_key);
+
                     add_greedy_face(
                         &mut self.mesh.vertices,
                         &mut self.mesh.indices,
@@ -596,6 +613,7 @@ impl Chunk {
                         width,
                         height,
                         random_rotation,
+                        ao_values,
                     );
                 }
             }
@@ -604,6 +622,7 @@ impl Chunk {
 
     /// Generate mesh with neighbor-aware culling and cache it
     /// Uses direct array indexing for O(1) texture lookup
+    /// Note: This legacy path doesn't support full AO (uses default AO of 1.0)
     pub fn generate_mesh(
         &mut self,
         texture_indices: &BlockTextureArray,
@@ -622,6 +641,9 @@ impl Chunk {
             self.position[1] as f32 * CHUNK_SIZE as f32,
             self.position[2] as f32 * CHUNK_SIZE as f32,
         );
+
+        // Create a simple AO calculator for this chunk (local only, no boundary sampling)
+        let ao_calc = SimpleAoCalculator::new(&self.blocks);
 
         for x in 0..CHUNK_SIZE {
             for y in 0..CHUNK_SIZE {
@@ -642,7 +664,8 @@ impl Chunk {
                         block.should_render_face_against(self.blocks[x + 1][y][z])
                     };
                     if should_render_pos_x {
-                        add_face(&mut self.mesh.vertices, &mut self.mesh.indices, pos, tex.sides, Face::Right);
+                        let ao = ao_calc.calculate_face_ao(x as i32, y as i32, z as i32, Face::Right);
+                        add_face(&mut self.mesh.vertices, &mut self.mesh.indices, pos, tex.sides, Face::Right, ao);
                     }
 
                     // -X face (Left)
@@ -652,7 +675,8 @@ impl Chunk {
                         block.should_render_face_against(self.blocks[x - 1][y][z])
                     };
                     if should_render_neg_x {
-                        add_face(&mut self.mesh.vertices, &mut self.mesh.indices, pos, tex.sides, Face::Left);
+                        let ao = ao_calc.calculate_face_ao(x as i32, y as i32, z as i32, Face::Left);
+                        add_face(&mut self.mesh.vertices, &mut self.mesh.indices, pos, tex.sides, Face::Left, ao);
                     }
 
                     // +Y face (Top)
@@ -662,7 +686,8 @@ impl Chunk {
                         block.should_render_face_against(self.blocks[x][y + 1][z])
                     };
                     if should_render_pos_y {
-                        add_face(&mut self.mesh.vertices, &mut self.mesh.indices, pos, tex.top, Face::Top);
+                        let ao = ao_calc.calculate_face_ao(x as i32, y as i32, z as i32, Face::Top);
+                        add_face(&mut self.mesh.vertices, &mut self.mesh.indices, pos, tex.top, Face::Top, ao);
                     }
 
                     // -Y face (Bottom)
@@ -672,7 +697,8 @@ impl Chunk {
                         block.should_render_face_against(self.blocks[x][y - 1][z])
                     };
                     if should_render_neg_y {
-                        add_face(&mut self.mesh.vertices, &mut self.mesh.indices, pos, tex.bottom, Face::Bottom);
+                        let ao = ao_calc.calculate_face_ao(x as i32, y as i32, z as i32, Face::Bottom);
+                        add_face(&mut self.mesh.vertices, &mut self.mesh.indices, pos, tex.bottom, Face::Bottom, ao);
                     }
 
                     // +Z face (Front)
@@ -682,7 +708,8 @@ impl Chunk {
                         block.should_render_face_against(self.blocks[x][y][z + 1])
                     };
                     if should_render_pos_z {
-                        add_face(&mut self.mesh.vertices, &mut self.mesh.indices, pos, tex.sides, Face::Front);
+                        let ao = ao_calc.calculate_face_ao(x as i32, y as i32, z as i32, Face::Front);
+                        add_face(&mut self.mesh.vertices, &mut self.mesh.indices, pos, tex.sides, Face::Front, ao);
                     }
 
                     // -Z face (Back)
@@ -692,13 +719,142 @@ impl Chunk {
                         block.should_render_face_against(self.blocks[x][y][z - 1])
                     };
                     if should_render_neg_z {
-                        add_face(&mut self.mesh.vertices, &mut self.mesh.indices, pos, tex.sides, Face::Back);
+                        let ao = ao_calc.calculate_face_ao(x as i32, y as i32, z as i32, Face::Back);
+                        add_face(&mut self.mesh.vertices, &mut self.mesh.indices, pos, tex.sides, Face::Back, ao);
                     }
                 }
             }
         }
 
         self.mesh.dirty = false;
+    }
+}
+
+/// Simple AO calculator that only uses local chunk data (no boundary sampling)
+/// Used by the legacy non-greedy mesh generation path
+struct SimpleAoCalculator<'a> {
+    blocks: &'a [[[BlockType; CHUNK_SIZE]; CHUNK_SIZE]; CHUNK_SIZE],
+}
+
+impl<'a> SimpleAoCalculator<'a> {
+    fn new(blocks: &'a [[[BlockType; CHUNK_SIZE]; CHUNK_SIZE]; CHUNK_SIZE]) -> Self {
+        Self { blocks }
+    }
+
+    #[inline]
+    fn is_solid(&self, x: i32, y: i32, z: i32) -> bool {
+        if x >= 0 && x < CHUNK_SIZE as i32 && y >= 0 && y < CHUNK_SIZE as i32 && z >= 0 && z < CHUNK_SIZE as i32 {
+            !self.blocks[x as usize][y as usize][z as usize].is_transparent()
+        } else {
+            false // Treat out-of-bounds as air
+        }
+    }
+
+    fn calculate_face_ao(&self, x: i32, y: i32, z: i32, face: Face) -> [f32; 4] {
+        match face {
+            Face::Top => {
+                let y = y + 1;
+                let n_xn = self.is_solid(x - 1, y, z);
+                let n_xp = self.is_solid(x + 1, y, z);
+                let n_zn = self.is_solid(x, y, z - 1);
+                let n_zp = self.is_solid(x, y, z + 1);
+                let n_xn_zn = self.is_solid(x - 1, y, z - 1);
+                let n_xn_zp = self.is_solid(x - 1, y, z + 1);
+                let n_xp_zn = self.is_solid(x + 1, y, z - 1);
+                let n_xp_zp = self.is_solid(x + 1, y, z + 1);
+                [
+                    calculate_ao(n_xn, n_zp, n_xn_zp),
+                    calculate_ao(n_xp, n_zp, n_xp_zp),
+                    calculate_ao(n_xp, n_zn, n_xp_zn),
+                    calculate_ao(n_xn, n_zn, n_xn_zn),
+                ]
+            }
+            Face::Bottom => {
+                let y = y - 1;
+                let n_xn = self.is_solid(x - 1, y, z);
+                let n_xp = self.is_solid(x + 1, y, z);
+                let n_zn = self.is_solid(x, y, z - 1);
+                let n_zp = self.is_solid(x, y, z + 1);
+                let n_xn_zn = self.is_solid(x - 1, y, z - 1);
+                let n_xn_zp = self.is_solid(x - 1, y, z + 1);
+                let n_xp_zn = self.is_solid(x + 1, y, z - 1);
+                let n_xp_zp = self.is_solid(x + 1, y, z + 1);
+                [
+                    calculate_ao(n_xn, n_zn, n_xn_zn),
+                    calculate_ao(n_xp, n_zn, n_xp_zn),
+                    calculate_ao(n_xp, n_zp, n_xp_zp),
+                    calculate_ao(n_xn, n_zp, n_xn_zp),
+                ]
+            }
+            Face::Left => {
+                let x = x - 1;
+                let n_yn = self.is_solid(x, y - 1, z);
+                let n_yp = self.is_solid(x, y + 1, z);
+                let n_zn = self.is_solid(x, y, z - 1);
+                let n_zp = self.is_solid(x, y, z + 1);
+                let n_yn_zn = self.is_solid(x, y - 1, z - 1);
+                let n_yn_zp = self.is_solid(x, y - 1, z + 1);
+                let n_yp_zn = self.is_solid(x, y + 1, z - 1);
+                let n_yp_zp = self.is_solid(x, y + 1, z + 1);
+                [
+                    calculate_ao(n_yn, n_zn, n_yn_zn),
+                    calculate_ao(n_yn, n_zp, n_yn_zp),
+                    calculate_ao(n_yp, n_zp, n_yp_zp),
+                    calculate_ao(n_yp, n_zn, n_yp_zn),
+                ]
+            }
+            Face::Right => {
+                let x = x + 1;
+                let n_yn = self.is_solid(x, y - 1, z);
+                let n_yp = self.is_solid(x, y + 1, z);
+                let n_zn = self.is_solid(x, y, z - 1);
+                let n_zp = self.is_solid(x, y, z + 1);
+                let n_yn_zn = self.is_solid(x, y - 1, z - 1);
+                let n_yn_zp = self.is_solid(x, y - 1, z + 1);
+                let n_yp_zn = self.is_solid(x, y + 1, z - 1);
+                let n_yp_zp = self.is_solid(x, y + 1, z + 1);
+                [
+                    calculate_ao(n_yn, n_zp, n_yn_zp),
+                    calculate_ao(n_yn, n_zn, n_yn_zn),
+                    calculate_ao(n_yp, n_zn, n_yp_zn),
+                    calculate_ao(n_yp, n_zp, n_yp_zp),
+                ]
+            }
+            Face::Front => {
+                let z = z + 1;
+                let n_xn = self.is_solid(x - 1, y, z);
+                let n_xp = self.is_solid(x + 1, y, z);
+                let n_yn = self.is_solid(x, y - 1, z);
+                let n_yp = self.is_solid(x, y + 1, z);
+                let n_xn_yn = self.is_solid(x - 1, y - 1, z);
+                let n_xn_yp = self.is_solid(x - 1, y + 1, z);
+                let n_xp_yn = self.is_solid(x + 1, y - 1, z);
+                let n_xp_yp = self.is_solid(x + 1, y + 1, z);
+                [
+                    calculate_ao(n_xn, n_yn, n_xn_yn),
+                    calculate_ao(n_xp, n_yn, n_xp_yn),
+                    calculate_ao(n_xp, n_yp, n_xp_yp),
+                    calculate_ao(n_xn, n_yp, n_xn_yp),
+                ]
+            }
+            Face::Back => {
+                let z = z - 1;
+                let n_xn = self.is_solid(x - 1, y, z);
+                let n_xp = self.is_solid(x + 1, y, z);
+                let n_yn = self.is_solid(x, y - 1, z);
+                let n_yp = self.is_solid(x, y + 1, z);
+                let n_xn_yn = self.is_solid(x - 1, y - 1, z);
+                let n_xn_yp = self.is_solid(x - 1, y + 1, z);
+                let n_xp_yn = self.is_solid(x + 1, y - 1, z);
+                let n_xp_yp = self.is_solid(x + 1, y + 1, z);
+                [
+                    calculate_ao(n_xp, n_yn, n_xp_yn),
+                    calculate_ao(n_xn, n_yn, n_xn_yn),
+                    calculate_ao(n_xn, n_yp, n_xn_yp),
+                    calculate_ao(n_xp, n_yp, n_xp_yp),
+                ]
+            }
+        }
     }
 }
 
@@ -712,6 +868,123 @@ pub enum Face {
     Back,
 }
 
+/// Calculate AO values for a merged quad's 4 corners
+/// For greedy-merged faces, we need to sample AO at the corner positions of the merged quad
+fn calculate_merged_quad_ao(
+    blocks: &[[[BlockType; CHUNK_SIZE]; CHUNK_SIZE]; CHUNK_SIZE],
+    neighbors: &BoundaryNeighbors,
+    x: i32,
+    y: i32,
+    z: i32,
+    face: Face,
+    width: usize,
+    height: usize,
+) -> [f32; 4] {
+    // Create a temporary AO sampler
+    let ao_sampler = AoSampler::new(blocks, neighbors);
+
+    // For a 1x1 quad, just use standard AO calculation
+    if width == 1 && height == 1 {
+        return ao_sampler.calculate_face_ao(x, y, z, face);
+    }
+
+    // For merged quads, we calculate AO at each of the 4 corner block positions
+    // The corners depend on the face orientation and how greedy meshing extends the quad
+    //
+    // Greedy meshing extends:
+    // - width along the "col" dimension
+    // - height along the "row" dimension
+
+    // For merged quads, we need to calculate AO at each corner block position
+    // and pick the specific vertex AO that corresponds to that corner of the merged quad.
+    //
+    // The vertex order in add_greedy_face for each face type:
+    // - Top:    [0]=(-X,+Z), [1]=(+X,+Z), [2]=(+X,-Z), [3]=(-X,-Z) relative to block
+    // - Bottom: [0]=(-X,-Z), [1]=(+X,-Z), [2]=(+X,+Z), [3]=(-X,+Z)
+    // - Left:   [0]=(-Y,-Z), [1]=(-Y,+Z), [2]=(+Y,+Z), [3]=(+Y,-Z)
+    // - Right:  [0]=(-Y,+Z), [1]=(-Y,-Z), [2]=(+Y,-Z), [3]=(+Y,+Z)
+    // - Front:  [0]=(-X,-Y), [1]=(+X,-Y), [2]=(+X,+Y), [3]=(-X,+Y)
+    // - Back:   [0]=(+X,-Y), [1]=(-X,-Y), [2]=(-X,+Y), [3]=(+X,+Y)
+    //
+    // For merged quads, the corners are at different block positions, but we need
+    // to pick the AO value that corresponds to the corner of the merged quad.
+
+    match face {
+        Face::Top => {
+            // Vertex positions in add_greedy_face:
+            // [0] = (x, y+1, z+w)     -> block at (x, y, z+w-1), need its -X,+Z corner = ao[0]
+            // [1] = (x+h, y+1, z+w)   -> block at (x+h-1, y, z+w-1), need its +X,+Z corner = ao[1]
+            // [2] = (x+h, y+1, z)     -> block at (x+h-1, y, z), need its +X,-Z corner = ao[2]
+            // [3] = (x, y+1, z)       -> block at (x, y, z), need its -X,-Z corner = ao[3]
+            let ao0 = ao_sampler.calculate_face_ao(x, y, z + width as i32 - 1, face)[0];
+            let ao1 = ao_sampler.calculate_face_ao(x + height as i32 - 1, y, z + width as i32 - 1, face)[1];
+            let ao2 = ao_sampler.calculate_face_ao(x + height as i32 - 1, y, z, face)[2];
+            let ao3 = ao_sampler.calculate_face_ao(x, y, z, face)[3];
+            [ao0, ao1, ao2, ao3]
+        }
+        Face::Bottom => {
+            // Vertex positions:
+            // [0] = (x, y, z)         -> block at (x, y, z), need its -X,-Z corner = ao[0]
+            // [1] = (x+h, y, z)       -> block at (x+h-1, y, z), need its +X,-Z corner = ao[1]
+            // [2] = (x+h, y, z+w)     -> block at (x+h-1, y, z+w-1), need its +X,+Z corner = ao[2]
+            // [3] = (x, y, z+w)       -> block at (x, y, z+w-1), need its -X,+Z corner = ao[3]
+            let ao0 = ao_sampler.calculate_face_ao(x, y, z, face)[0];
+            let ao1 = ao_sampler.calculate_face_ao(x + height as i32 - 1, y, z, face)[1];
+            let ao2 = ao_sampler.calculate_face_ao(x + height as i32 - 1, y, z + width as i32 - 1, face)[2];
+            let ao3 = ao_sampler.calculate_face_ao(x, y, z + width as i32 - 1, face)[3];
+            [ao0, ao1, ao2, ao3]
+        }
+        Face::Left => {
+            // Vertex positions:
+            // [0] = (x, y, z)         -> block at (x, y, z), need its -Y,-Z corner = ao[0]
+            // [1] = (x, y, z+w)       -> block at (x, y, z+w-1), need its -Y,+Z corner = ao[1]
+            // [2] = (x, y+h, z+w)     -> block at (x, y+h-1, z+w-1), need its +Y,+Z corner = ao[2]
+            // [3] = (x, y+h, z)       -> block at (x, y+h-1, z), need its +Y,-Z corner = ao[3]
+            let ao0 = ao_sampler.calculate_face_ao(x, y, z, face)[0];
+            let ao1 = ao_sampler.calculate_face_ao(x, y, z + width as i32 - 1, face)[1];
+            let ao2 = ao_sampler.calculate_face_ao(x, y + height as i32 - 1, z + width as i32 - 1, face)[2];
+            let ao3 = ao_sampler.calculate_face_ao(x, y + height as i32 - 1, z, face)[3];
+            [ao0, ao1, ao2, ao3]
+        }
+        Face::Right => {
+            // Vertex positions:
+            // [0] = (x+1, y, z+w)     -> block at (x, y, z+w-1), need its -Y,+Z corner = ao[0]
+            // [1] = (x+1, y, z)       -> block at (x, y, z), need its -Y,-Z corner = ao[1]
+            // [2] = (x+1, y+h, z)     -> block at (x, y+h-1, z), need its +Y,-Z corner = ao[2]
+            // [3] = (x+1, y+h, z+w)   -> block at (x, y+h-1, z+w-1), need its +Y,+Z corner = ao[3]
+            let ao0 = ao_sampler.calculate_face_ao(x, y, z + width as i32 - 1, face)[0];
+            let ao1 = ao_sampler.calculate_face_ao(x, y, z, face)[1];
+            let ao2 = ao_sampler.calculate_face_ao(x, y + height as i32 - 1, z, face)[2];
+            let ao3 = ao_sampler.calculate_face_ao(x, y + height as i32 - 1, z + width as i32 - 1, face)[3];
+            [ao0, ao1, ao2, ao3]
+        }
+        Face::Front => {
+            // Vertex positions:
+            // [0] = (x, y, z+1)       -> block at (x, y, z), need its -X,-Y corner = ao[0]
+            // [1] = (x+h, y, z+1)     -> block at (x+h-1, y, z), need its +X,-Y corner = ao[1]
+            // [2] = (x+h, y+w, z+1)   -> block at (x+h-1, y+w-1, z), need its +X,+Y corner = ao[2]
+            // [3] = (x, y+w, z+1)     -> block at (x, y+w-1, z), need its -X,+Y corner = ao[3]
+            let ao0 = ao_sampler.calculate_face_ao(x, y, z, face)[0];
+            let ao1 = ao_sampler.calculate_face_ao(x + height as i32 - 1, y, z, face)[1];
+            let ao2 = ao_sampler.calculate_face_ao(x + height as i32 - 1, y + width as i32 - 1, z, face)[2];
+            let ao3 = ao_sampler.calculate_face_ao(x, y + width as i32 - 1, z, face)[3];
+            [ao0, ao1, ao2, ao3]
+        }
+        Face::Back => {
+            // Vertex positions:
+            // [0] = (x+h, y, z)       -> block at (x+h-1, y, z), need its +X,-Y corner = ao[0]
+            // [1] = (x, y, z)         -> block at (x, y, z), need its -X,-Y corner = ao[1]
+            // [2] = (x, y+w, z)       -> block at (x, y+w-1, z), need its -X,+Y corner = ao[2]
+            // [3] = (x+h, y+w, z)     -> block at (x+h-1, y+w-1, z), need its +X,+Y corner = ao[3]
+            let ao0 = ao_sampler.calculate_face_ao(x + height as i32 - 1, y, z, face)[0];
+            let ao1 = ao_sampler.calculate_face_ao(x, y, z, face)[1];
+            let ao2 = ao_sampler.calculate_face_ao(x, y + width as i32 - 1, z, face)[2];
+            let ao3 = ao_sampler.calculate_face_ao(x + height as i32 - 1, y + width as i32 - 1, z, face)[3];
+            [ao0, ao1, ao2, ao3]
+        }
+    }
+}
+
 /// Add a single 1x1 face (used by non-greedy meshing)
 fn add_face(
     vertices: &mut Vec<Vertex>,
@@ -719,8 +992,9 @@ fn add_face(
     pos: Vec3,
     tex_layer: u32,
     face: Face,
+    ao_values: [f32; 4],
 ) {
-    add_greedy_face(vertices, indices, pos, tex_layer, face, 1, 1, false);
+    add_greedy_face(vertices, indices, pos, tex_layer, face, 1, 1, false, ao_values);
 }
 
 /// Simple hash function for deterministic random rotation based on position
@@ -744,6 +1018,252 @@ fn rotate_uv(uv: [f32; 2], rotation: u8, w: f32, h: f32) -> [f32; 2] {
     }
 }
 
+/// Pack 4 AO values into a u32 key for greedy mesh comparison
+/// Each AO value is quantized to 8 bits
+#[inline]
+fn ao_to_key(ao: &[f32; 4]) -> u32 {
+    let a0 = (ao[0] * 255.0) as u32;
+    let a1 = (ao[1] * 255.0) as u32;
+    let a2 = (ao[2] * 255.0) as u32;
+    let a3 = (ao[3] * 255.0) as u32;
+    (a0 << 24) | (a1 << 16) | (a2 << 8) | a3
+}
+
+/// Unpack a u32 key back into 4 AO values
+#[inline]
+fn key_to_ao(key: u32) -> [f32; 4] {
+    [
+        ((key >> 24) & 0xFF) as f32 / 255.0,
+        ((key >> 16) & 0xFF) as f32 / 255.0,
+        ((key >> 8) & 0xFF) as f32 / 255.0,
+        (key & 0xFF) as f32 / 255.0,
+    ]
+}
+
+/// Calculate ambient occlusion value for a vertex based on neighboring blocks
+/// Uses the standard voxel AO algorithm: count solid blocks in the 3 neighbors
+/// side1, side2 are the two edge neighbors, corner is the diagonal neighbor
+/// Returns AO value from 0.0 (fully occluded) to 1.0 (no occlusion)
+#[inline]
+fn calculate_ao(side1: bool, side2: bool, corner: bool) -> f32 {
+    // Standard voxel AO formula
+    // If both sides are solid, corner doesn't matter (fully occluded)
+    // Otherwise count solid neighbors
+    let ao_level = if side1 && side2 {
+        0
+    } else {
+        3 - (side1 as u8 + side2 as u8 + corner as u8)
+    };
+    // Map 0-3 to brightness values with nice curve
+    match ao_level {
+        0 => 0.2,  // Fully occluded (dark corner)
+        1 => 0.5,
+        2 => 0.75,
+        3 => 1.0,  // No occlusion
+        _ => 1.0,
+    }
+}
+
+/// AO lookup data for a chunk - caches which positions are solid for AO sampling
+/// This allows sampling outside chunk boundaries
+pub struct AoSampler<'a> {
+    blocks: &'a [[[BlockType; CHUNK_SIZE]; CHUNK_SIZE]; CHUNK_SIZE],
+    neighbors: &'a BoundaryNeighbors<'a>,
+}
+
+impl<'a> AoSampler<'a> {
+    pub fn new(blocks: &'a [[[BlockType; CHUNK_SIZE]; CHUNK_SIZE]; CHUNK_SIZE], neighbors: &'a BoundaryNeighbors<'a>) -> Self {
+        Self { blocks, neighbors }
+    }
+
+    /// Check if a block position is solid (for AO calculation)
+    /// Handles positions outside chunk boundaries using neighbor data
+    #[inline]
+    fn is_solid(&self, x: i32, y: i32, z: i32) -> bool {
+        // Inside chunk bounds
+        if x >= 0 && x < CHUNK_SIZE as i32 && y >= 0 && y < CHUNK_SIZE as i32 && z >= 0 && z < CHUNK_SIZE as i32 {
+            return !self.blocks[x as usize][y as usize][z as usize].is_transparent();
+        }
+
+        // Outside chunk - check neighbor boundaries
+        // For AO, we treat missing neighbors as air (not solid)
+        if x < 0 {
+            if let Some(boundary) = self.neighbors.neg_x {
+                if y >= 0 && y < CHUNK_SIZE as i32 && z >= 0 && z < CHUNK_SIZE as i32 {
+                    return !boundary[y as usize][z as usize].is_transparent();
+                }
+            }
+            return false;
+        }
+        if x >= CHUNK_SIZE as i32 {
+            if let Some(boundary) = self.neighbors.pos_x {
+                if y >= 0 && y < CHUNK_SIZE as i32 && z >= 0 && z < CHUNK_SIZE as i32 {
+                    return !boundary[y as usize][z as usize].is_transparent();
+                }
+            }
+            return false;
+        }
+        if y < 0 {
+            if let Some(boundary) = self.neighbors.neg_y {
+                if x >= 0 && x < CHUNK_SIZE as i32 && z >= 0 && z < CHUNK_SIZE as i32 {
+                    return !boundary[x as usize][z as usize].is_transparent();
+                }
+            }
+            return false;
+        }
+        if y >= CHUNK_SIZE as i32 {
+            if let Some(boundary) = self.neighbors.pos_y {
+                if x >= 0 && x < CHUNK_SIZE as i32 && z >= 0 && z < CHUNK_SIZE as i32 {
+                    return !boundary[x as usize][z as usize].is_transparent();
+                }
+            }
+            return false;
+        }
+        if z < 0 {
+            if let Some(boundary) = self.neighbors.neg_z {
+                if x >= 0 && x < CHUNK_SIZE as i32 && y >= 0 && y < CHUNK_SIZE as i32 {
+                    return !boundary[x as usize][y as usize].is_transparent();
+                }
+            }
+            return false;
+        }
+        if z >= CHUNK_SIZE as i32 {
+            if let Some(boundary) = self.neighbors.pos_z {
+                if x >= 0 && x < CHUNK_SIZE as i32 && y >= 0 && y < CHUNK_SIZE as i32 {
+                    return !boundary[x as usize][y as usize].is_transparent();
+                }
+            }
+            return false;
+        }
+
+        false // Default to air for corners outside all boundaries
+    }
+
+    /// Calculate AO values for the 4 vertices of a face
+    /// Returns [ao0, ao1, ao2, ao3] for the quad vertices
+    pub fn calculate_face_ao(&self, x: i32, y: i32, z: i32, face: Face) -> [f32; 4] {
+        // For each face, we need to sample the 8 neighbors in the plane of the face
+        // Each vertex uses 3 of those neighbors: 2 edge neighbors and 1 corner
+        match face {
+            Face::Top => {
+                // Face at y+1, sample neighbors at y+1 level
+                let y = y + 1;
+                // Neighbors in the XZ plane at y+1
+                let n_xn = self.is_solid(x - 1, y, z);     // -X
+                let n_xp = self.is_solid(x + 1, y, z);     // +X
+                let n_zn = self.is_solid(x, y, z - 1);     // -Z
+                let n_zp = self.is_solid(x, y, z + 1);     // +Z
+                let n_xn_zn = self.is_solid(x - 1, y, z - 1); // -X -Z
+                let n_xn_zp = self.is_solid(x - 1, y, z + 1); // -X +Z
+                let n_xp_zn = self.is_solid(x + 1, y, z - 1); // +X -Z
+                let n_xp_zp = self.is_solid(x + 1, y, z + 1); // +X +Z
+
+                [
+                    calculate_ao(n_xn, n_zp, n_xn_zp), // vertex at (-X, +Z)
+                    calculate_ao(n_xp, n_zp, n_xp_zp), // vertex at (+X, +Z)
+                    calculate_ao(n_xp, n_zn, n_xp_zn), // vertex at (+X, -Z)
+                    calculate_ao(n_xn, n_zn, n_xn_zn), // vertex at (-X, -Z)
+                ]
+            }
+            Face::Bottom => {
+                // Face at y, sample neighbors at y-1 level
+                let y = y - 1;
+                let n_xn = self.is_solid(x - 1, y, z);
+                let n_xp = self.is_solid(x + 1, y, z);
+                let n_zn = self.is_solid(x, y, z - 1);
+                let n_zp = self.is_solid(x, y, z + 1);
+                let n_xn_zn = self.is_solid(x - 1, y, z - 1);
+                let n_xn_zp = self.is_solid(x - 1, y, z + 1);
+                let n_xp_zn = self.is_solid(x + 1, y, z - 1);
+                let n_xp_zp = self.is_solid(x + 1, y, z + 1);
+
+                [
+                    calculate_ao(n_xn, n_zn, n_xn_zn), // vertex at (-X, -Z)
+                    calculate_ao(n_xp, n_zn, n_xp_zn), // vertex at (+X, -Z)
+                    calculate_ao(n_xp, n_zp, n_xp_zp), // vertex at (+X, +Z)
+                    calculate_ao(n_xn, n_zp, n_xn_zp), // vertex at (-X, +Z)
+                ]
+            }
+            Face::Left => {
+                // Face at x, sample neighbors at x-1 level
+                let x = x - 1;
+                let n_yn = self.is_solid(x, y - 1, z);
+                let n_yp = self.is_solid(x, y + 1, z);
+                let n_zn = self.is_solid(x, y, z - 1);
+                let n_zp = self.is_solid(x, y, z + 1);
+                let n_yn_zn = self.is_solid(x, y - 1, z - 1);
+                let n_yn_zp = self.is_solid(x, y - 1, z + 1);
+                let n_yp_zn = self.is_solid(x, y + 1, z - 1);
+                let n_yp_zp = self.is_solid(x, y + 1, z + 1);
+
+                [
+                    calculate_ao(n_yn, n_zn, n_yn_zn), // vertex at (-Y, -Z)
+                    calculate_ao(n_yn, n_zp, n_yn_zp), // vertex at (-Y, +Z)
+                    calculate_ao(n_yp, n_zp, n_yp_zp), // vertex at (+Y, +Z)
+                    calculate_ao(n_yp, n_zn, n_yp_zn), // vertex at (+Y, -Z)
+                ]
+            }
+            Face::Right => {
+                // Face at x+1, sample neighbors at x+1 level
+                let x = x + 1;
+                let n_yn = self.is_solid(x, y - 1, z);
+                let n_yp = self.is_solid(x, y + 1, z);
+                let n_zn = self.is_solid(x, y, z - 1);
+                let n_zp = self.is_solid(x, y, z + 1);
+                let n_yn_zn = self.is_solid(x, y - 1, z - 1);
+                let n_yn_zp = self.is_solid(x, y - 1, z + 1);
+                let n_yp_zn = self.is_solid(x, y + 1, z - 1);
+                let n_yp_zp = self.is_solid(x, y + 1, z + 1);
+
+                [
+                    calculate_ao(n_yn, n_zp, n_yn_zp), // vertex at (-Y, +Z)
+                    calculate_ao(n_yn, n_zn, n_yn_zn), // vertex at (-Y, -Z)
+                    calculate_ao(n_yp, n_zn, n_yp_zn), // vertex at (+Y, -Z)
+                    calculate_ao(n_yp, n_zp, n_yp_zp), // vertex at (+Y, +Z)
+                ]
+            }
+            Face::Front => {
+                // Face at z+1, sample neighbors at z+1 level
+                let z = z + 1;
+                let n_xn = self.is_solid(x - 1, y, z);
+                let n_xp = self.is_solid(x + 1, y, z);
+                let n_yn = self.is_solid(x, y - 1, z);
+                let n_yp = self.is_solid(x, y + 1, z);
+                let n_xn_yn = self.is_solid(x - 1, y - 1, z);
+                let n_xn_yp = self.is_solid(x - 1, y + 1, z);
+                let n_xp_yn = self.is_solid(x + 1, y - 1, z);
+                let n_xp_yp = self.is_solid(x + 1, y + 1, z);
+
+                [
+                    calculate_ao(n_xn, n_yn, n_xn_yn), // vertex at (-X, -Y)
+                    calculate_ao(n_xp, n_yn, n_xp_yn), // vertex at (+X, -Y)
+                    calculate_ao(n_xp, n_yp, n_xp_yp), // vertex at (+X, +Y)
+                    calculate_ao(n_xn, n_yp, n_xn_yp), // vertex at (-X, +Y)
+                ]
+            }
+            Face::Back => {
+                // Face at z, sample neighbors at z-1 level
+                let z = z - 1;
+                let n_xn = self.is_solid(x - 1, y, z);
+                let n_xp = self.is_solid(x + 1, y, z);
+                let n_yn = self.is_solid(x, y - 1, z);
+                let n_yp = self.is_solid(x, y + 1, z);
+                let n_xn_yn = self.is_solid(x - 1, y - 1, z);
+                let n_xn_yp = self.is_solid(x - 1, y + 1, z);
+                let n_xp_yn = self.is_solid(x + 1, y - 1, z);
+                let n_xp_yp = self.is_solid(x + 1, y + 1, z);
+
+                [
+                    calculate_ao(n_xp, n_yn, n_xp_yn), // vertex at (+X, -Y)
+                    calculate_ao(n_xn, n_yn, n_xn_yn), // vertex at (-X, -Y)
+                    calculate_ao(n_xn, n_yp, n_xn_yp), // vertex at (-X, +Y)
+                    calculate_ao(n_xp, n_yp, n_xp_yp), // vertex at (+X, +Y)
+                ]
+            }
+        }
+    }
+}
+
 /// Add a merged face from greedy meshing with proper UV tiling
 /// width and height are in blocks; UVs are scaled to tile the texture
 fn add_greedy_face(
@@ -755,6 +1275,7 @@ fn add_greedy_face(
     width: usize,
     height: usize,
     random_rotation: bool,
+    ao_values: [f32; 4],
 ) {
     let base_index = vertices.len() as u32;
     let w = width as f32;
@@ -862,6 +1383,7 @@ fn add_greedy_face(
             uv,
             normal,
             tex_layer,
+            ao: ao_values[i],
         });
     }
 
