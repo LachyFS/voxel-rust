@@ -337,14 +337,25 @@ impl World {
             self.mark_neighbors_for_remesh(pos);
         }
 
-        // Find chunks that need to be loaded
-        let chunks_to_load: Vec<ChunkPos> = self.desired_chunks
+        // Find chunks that need to be loaded and sort by distance to player
+        let mut chunks_to_load: Vec<ChunkPos> = self.desired_chunks
             .iter()
             .filter(|pos| !self.chunks.contains_key(pos))
             .copied()
             .collect();
 
         if !chunks_to_load.is_empty() {
+            // Sort by squared distance to player chunk (closest first)
+            // We use squared distance to avoid sqrt, and weight Y less since vertical distance matters less
+            chunks_to_load.sort_by_key(|&(cx, cy, cz)| {
+                let dx = cx - player_cx;
+                let dz = cz - player_cz;
+                // Horizontal distance matters most, vertical (Y) is weighted less
+                // since chunks directly below/above are less important than those ahead
+                let dy = cy - (self.height_chunks / 2); // Distance from middle height
+                dx * dx + dz * dz + (dy * dy) / 4
+            });
+
             // Limit chunks per frame to spread load (max 8 chunks per update)
             let max_chunks_per_frame = 8;
             let chunks_this_frame: Vec<ChunkPos> = chunks_to_load
