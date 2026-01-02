@@ -102,9 +102,14 @@ impl BlockType {
             return true;
         }
 
-        // For transparent blocks, render unless adjacent is the same type
+        // For cutout blocks (leaves with holes), always render faces even against same type
+        // This ensures you can see through the transparent parts to blocks behind
+        if self.is_cutout() {
+            return true;
+        }
+
+        // For other transparent blocks (water, ice), render unless adjacent is the same type
         // This prevents z-fighting between identical transparent blocks
-        // but ensures we see through leaves to the world beyond
         if self.is_transparent() {
             return *self != adjacent;
         }
@@ -113,6 +118,15 @@ impl BlockType {
         // 1. Adjacent is not solid (air) - already handled above
         // 2. Adjacent is transparent (so we can see this block through the transparent one)
         adjacent.is_transparent()
+    }
+
+    /// Returns true for blocks with cutout transparency (holes in texture)
+    /// These need all faces rendered even between identical blocks
+    pub fn is_cutout(&self) -> bool {
+        matches!(
+            self,
+            BlockType::Leaves | BlockType::SpruceLeaves | BlockType::DeadBush | BlockType::TallGrass
+        )
     }
 
     pub fn name(&self) -> &'static str {

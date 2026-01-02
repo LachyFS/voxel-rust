@@ -18,6 +18,8 @@
 [settings]
 # Scale for biome noise (smaller = larger biomes)
 biome_scale = 0.005
+# Blend radius for smooth biome transitions (0.0 = hard edges, higher = smoother)
+blend_radius = 0.15
 
 [biomes]
 

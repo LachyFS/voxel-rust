@@ -115,6 +115,13 @@ pub struct BiomesConfig {
 pub struct BiomeSettings {
     /// Scale for biome noise (smaller = larger biomes)
     pub biome_scale: f64,
+    /// Blend radius for smooth biome transitions (default 0.15)
+    #[serde(default = "default_blend_radius")]
+    pub blend_radius: f64,
+}
+
+fn default_blend_radius() -> f64 {
+    0.15
 }
 
 #[derive(Debug, Deserialize)]
@@ -190,6 +197,7 @@ pub struct CompiledBiome {
 #[derive(Clone, Debug)]
 pub struct CompiledBiomesConfig {
     pub biome_scale: f64,
+    pub blend_radius: f64,
     pub biomes: Vec<CompiledBiome>,
 }
 
@@ -197,6 +205,7 @@ impl Default for CompiledBiomesConfig {
     fn default() -> Self {
         Self {
             biome_scale: 0.005,
+            blend_radius: 0.15,
             biomes: vec![
                 CompiledBiome {
                     name: "plains".to_string(),
@@ -338,6 +347,7 @@ impl CompiledBiomesConfig {
 
         Self {
             biome_scale: config.settings.biome_scale,
+            blend_radius: config.settings.blend_radius,
             biomes,
         }
     }

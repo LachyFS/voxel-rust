@@ -171,6 +171,32 @@ fn structure_hash(x: i32, z: i32, seed: u32) -> u8 {
 /// Chunk coordinate key for HashMap
 pub type ChunkPos = (i32, i32, i32);
 
+// ============================================================================
+// Biome Blending
+// ============================================================================
+
+/// Blended terrain parameters for smooth biome transitions
+#[derive(Clone, Debug)]
+struct BlendedTerrainParams {
+    height_scale: f64,
+    base_height: f64,
+    noise_scale: f64,
+    detail_strength: f64,
+    flatness: f64,
+}
+
+/// Calculate distance from a value to a range (0 if inside range)
+#[inline]
+fn distance_to_range(value: f64, min: f64, max: f64) -> f64 {
+    if value < min {
+        min - value
+    } else if value > max {
+        value - max
+    } else {
+        0.0
+    }
+}
+
 /// World generation parameters
 pub struct WorldGenConfig {
     pub seed: u32,
@@ -266,10 +292,35 @@ impl WorldGenerator {
     }
 
     fn get_terrain_height(&self, x: i32, z: i32) -> i32 {
-        let biome = self.get_biome(x, z);
-        self.get_terrain_height_for_biome(x, z, biome)
+        // Use blended parameters for smooth biome transitions
+        let params = self.get_blended_terrain_params(x, z);
+        self.get_terrain_height_with_params(x, z, &params)
     }
 
+    fn get_terrain_height_with_params(&self, x: i32, z: i32, params: &BlendedTerrainParams) -> i32 {
+        let scale = self.config.terrain_scale * params.noise_scale;
+
+        // Get base terrain noise
+        let base = self.terrain_noise.get([x as f64 * scale, z as f64 * scale]);
+
+        // Apply flatness - interpolate between noise and 0 (flat)
+        let flattened_base = base * (1.0 - params.flatness);
+
+        // Get detail noise with biome-specific strength
+        let detail = self.detail_noise.get([x as f64 * scale * 4.0, z as f64 * scale * 4.0])
+            * params.detail_strength;
+
+        // Combine and normalize to 0-1 range
+        let combined = flattened_base + detail;
+        let normalized = (combined + 1.0) / 2.0;
+
+        // Apply blended height scaling and base height offset
+        let height_variation = (normalized * self.config.terrain_height * params.height_scale) as i32;
+
+        self.config.sea_level + params.base_height as i32 + height_variation
+    }
+
+    #[allow(dead_code)]
     fn get_terrain_height_for_biome(&self, x: i32, z: i32, biome: &CompiledBiome) -> i32 {
         let scale = self.config.terrain_scale * biome.noise_scale;
 
@@ -313,6 +364,93 @@ impl WorldGenerator {
 
         // Fallback to first biome if none match (shouldn't happen with proper config)
         &self.biomes_config.biomes[0]
+    }
+
+    /// Calculate blend weights for all biomes based on temperature/moisture distance
+    /// Returns a vector of (biome_index, weight) pairs for biomes with non-zero weights
+    fn get_biome_weights(&self, x: i32, z: i32) -> Vec<(usize, f64)> {
+        let scale = self.biomes_config.biome_scale;
+        let temperature = self.biome_noise.get([x as f64 * scale, z as f64 * scale]);
+        let moisture = self
+            .biome_noise
+            .get([x as f64 * scale + 1000.0, z as f64 * scale + 1000.0]);
+
+        // Blend radius in temperature/moisture space (how far to blend at biome edges)
+        let blend_radius = self.biomes_config.blend_radius;
+
+        let mut weights: Vec<(usize, f64)> = Vec::new();
+        let mut total_weight = 0.0;
+
+        for (i, biome) in self.biomes_config.biomes.iter().enumerate() {
+            // Calculate distance to biome's temperature/moisture range
+            let temp_dist = distance_to_range(temperature, biome.temperature_min, biome.temperature_max);
+            let moist_dist = distance_to_range(moisture, biome.moisture_min, biome.moisture_max);
+
+            // Combined distance (Euclidean in temperature/moisture space)
+            let distance = (temp_dist * temp_dist + moist_dist * moist_dist).sqrt();
+
+            // Only consider biomes within blend radius
+            if distance < blend_radius {
+                // Smooth falloff: 1.0 at distance 0, 0.0 at blend_radius
+                // Using smoothstep for nicer interpolation
+                let t = distance / blend_radius;
+                let weight = 1.0 - (t * t * (3.0 - 2.0 * t)); // smoothstep
+
+                weights.push((i, weight));
+                total_weight += weight;
+            }
+        }
+
+        // Normalize weights so they sum to 1.0
+        if total_weight > 0.0 {
+            for (_, weight) in &mut weights {
+                *weight /= total_weight;
+            }
+        } else {
+            // Fallback: if no biomes in range, use the closest one with weight 1.0
+            let mut min_dist = f64::MAX;
+            let mut closest_idx = 0;
+            for (i, biome) in self.biomes_config.biomes.iter().enumerate() {
+                let temp_dist = distance_to_range(temperature, biome.temperature_min, biome.temperature_max);
+                let moist_dist = distance_to_range(moisture, biome.moisture_min, biome.moisture_max);
+                let distance = (temp_dist * temp_dist + moist_dist * moist_dist).sqrt();
+                if distance < min_dist {
+                    min_dist = distance;
+                    closest_idx = i;
+                }
+            }
+            weights.push((closest_idx, 1.0));
+        }
+
+        weights
+    }
+
+    /// Get blended terrain parameters by interpolating across nearby biomes
+    fn get_blended_terrain_params(&self, x: i32, z: i32) -> BlendedTerrainParams {
+        let weights = self.get_biome_weights(x, z);
+
+        let mut height_scale = 0.0;
+        let mut base_height = 0.0;
+        let mut noise_scale = 0.0;
+        let mut detail_strength = 0.0;
+        let mut flatness = 0.0;
+
+        for (idx, weight) in weights {
+            let biome = &self.biomes_config.biomes[idx];
+            height_scale += biome.height_scale * weight;
+            base_height += biome.base_height as f64 * weight;
+            noise_scale += biome.noise_scale * weight;
+            detail_strength += biome.detail_strength * weight;
+            flatness += biome.flatness * weight;
+        }
+
+        BlendedTerrainParams {
+            height_scale,
+            base_height,
+            noise_scale,
+            detail_strength,
+            flatness,
+        }
     }
 
     /// Get block at position (legacy method without structure support)

@@ -118,8 +118,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Sample from texture array using layer index
     let tex_color = textureSample(block_textures, block_sampler, in.uv, in.tex_layer);
 
-    // Discard fully transparent pixels (for leaves, etc.)
-    if tex_color.a < 0.1 {
+    // Discard transparent pixels using alpha testing
+    // Using 0.5 threshold for clean cutout rendering of leaves, etc.
+    // This avoids transparency sorting issues that cause the "xray" look
+    if tex_color.a < 0.5 {
         discard;
     }
 
