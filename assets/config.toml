@@ -3,10 +3,10 @@
 [rendering]
 # Horizontal render distance in chunks (each chunk is 16 blocks)
 # Higher values = more visible terrain, but more memory and GPU usage
-render_distance = 4
+render_distance = 10
 
 # Vertical render distance in chunks
-height_chunks = 4
+height_chunks = 6
 
 [terrain]
 # World generation seed (same seed = same world)
@@ -16,10 +16,10 @@ seed = 42
 sea_level = 32
 
 # Terrain noise scale (smaller = more spread out features)
-terrain_scale = 0.02
+terrain_scale = 0.01
 
 # Maximum terrain height variation in blocks
-terrain_height = 32.0
+terrain_height = 64.0
 
 # Cave generation scale (smaller = larger caves)
 cave_scale = 0.08
