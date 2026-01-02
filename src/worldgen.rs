@@ -266,11 +266,31 @@ impl WorldGenerator {
     }
 
     fn get_terrain_height(&self, x: i32, z: i32) -> i32 {
-        let scale = self.config.terrain_scale;
+        let biome = self.get_biome(x, z);
+        self.get_terrain_height_for_biome(x, z, biome)
+    }
+
+    fn get_terrain_height_for_biome(&self, x: i32, z: i32, biome: &CompiledBiome) -> i32 {
+        let scale = self.config.terrain_scale * biome.noise_scale;
+
+        // Get base terrain noise
         let base = self.terrain_noise.get([x as f64 * scale, z as f64 * scale]);
-        let detail = self.detail_noise.get([x as f64 * scale * 4.0, z as f64 * scale * 4.0]) * 0.25;
-        let normalized = (base + detail + 1.0) / 2.0;
-        self.config.sea_level + (normalized * self.config.terrain_height) as i32
+
+        // Apply flatness - interpolate between noise and 0 (flat)
+        let flattened_base = base * (1.0 - biome.flatness);
+
+        // Get detail noise with biome-specific strength
+        let detail = self.detail_noise.get([x as f64 * scale * 4.0, z as f64 * scale * 4.0])
+            * biome.detail_strength;
+
+        // Combine and normalize to 0-1 range
+        let combined = flattened_base + detail;
+        let normalized = (combined + 1.0) / 2.0;
+
+        // Apply biome-specific height scaling and base height offset
+        let height_variation = (normalized * self.config.terrain_height * biome.height_scale) as i32;
+
+        self.config.sea_level + biome.base_height + height_variation
     }
 
     fn get_biome(&self, x: i32, z: i32) -> &CompiledBiome {

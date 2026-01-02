@@ -134,6 +134,33 @@ pub struct BiomeDefinition {
     /// Height above sea level where stone replaces grass (optional)
     #[serde(default)]
     pub stone_altitude: Option<i32>,
+    /// Terrain height multiplier (default 1.0, higher = taller terrain)
+    #[serde(default = "default_height_scale")]
+    pub height_scale: f64,
+    /// Base height offset relative to sea level (default 0)
+    #[serde(default)]
+    pub base_height: i32,
+    /// Terrain noise frequency multiplier (default 1.0, higher = more jagged)
+    #[serde(default = "default_one")]
+    pub noise_scale: f64,
+    /// Detail noise strength (default 0.25, 0 = smooth, higher = rougher)
+    #[serde(default = "default_detail_strength")]
+    pub detail_strength: f64,
+    /// Terrain flatness (0.0 = normal, 1.0 = completely flat)
+    #[serde(default)]
+    pub flatness: f64,
+}
+
+fn default_height_scale() -> f64 {
+    1.0
+}
+
+fn default_one() -> f64 {
+    1.0
+}
+
+fn default_detail_strength() -> f64 {
+    0.25
 }
 
 /// Compiled biome data for efficient runtime lookup
@@ -147,6 +174,16 @@ pub struct CompiledBiome {
     pub surface_block: BlockType,
     pub subsurface_block: BlockType,
     pub stone_altitude: Option<i32>,
+    /// Terrain height multiplier (higher = taller terrain)
+    pub height_scale: f64,
+    /// Base height offset relative to sea level
+    pub base_height: i32,
+    /// Terrain noise frequency multiplier (higher = more jagged)
+    pub noise_scale: f64,
+    /// Detail noise strength (0 = smooth, higher = rougher)
+    pub detail_strength: f64,
+    /// Terrain flatness (0.0 = normal, 1.0 = completely flat)
+    pub flatness: f64,
 }
 
 /// Compiled biomes configuration ready for worldgen
@@ -170,6 +207,11 @@ impl Default for CompiledBiomesConfig {
                     surface_block: BlockType::Grass,
                     subsurface_block: BlockType::Dirt,
                     stone_altitude: None,
+                    height_scale: 0.5,
+                    base_height: 0,
+                    noise_scale: 1.0,
+                    detail_strength: 0.15,
+                    flatness: 0.3,
                 },
                 CompiledBiome {
                     name: "forest".to_string(),
@@ -180,6 +222,11 @@ impl Default for CompiledBiomesConfig {
                     surface_block: BlockType::Grass,
                     subsurface_block: BlockType::Dirt,
                     stone_altitude: None,
+                    height_scale: 0.7,
+                    base_height: 5,
+                    noise_scale: 1.0,
+                    detail_strength: 0.25,
+                    flatness: 0.0,
                 },
                 CompiledBiome {
                     name: "desert".to_string(),
@@ -190,6 +237,11 @@ impl Default for CompiledBiomesConfig {
                     surface_block: BlockType::Sand,
                     subsurface_block: BlockType::Sand,
                     stone_altitude: None,
+                    height_scale: 0.4,
+                    base_height: -5,
+                    noise_scale: 0.8,
+                    detail_strength: 0.1,
+                    flatness: 0.5,
                 },
                 CompiledBiome {
                     name: "mountains".to_string(),
@@ -200,6 +252,11 @@ impl Default for CompiledBiomesConfig {
                     surface_block: BlockType::Grass,
                     subsurface_block: BlockType::Dirt,
                     stone_altitude: Some(20),
+                    height_scale: 2.0,
+                    base_height: 20,
+                    noise_scale: 1.5,
+                    detail_strength: 0.4,
+                    flatness: 0.0,
                 },
             ],
         }
@@ -271,6 +328,11 @@ impl CompiledBiomesConfig {
                 surface_block: parse_block_type(&def.surface_block),
                 subsurface_block: parse_block_type(&def.subsurface_block),
                 stone_altitude: def.stone_altitude,
+                height_scale: def.height_scale,
+                base_height: def.base_height,
+                noise_scale: def.noise_scale,
+                detail_strength: def.detail_strength,
+                flatness: def.flatness,
             })
             .collect();
 

@@ -7,6 +7,13 @@
 #   surface_block: Block type for the surface layer
 #   subsurface_block: Block type for layers below surface (up to 4 blocks deep)
 #   stone_altitude: Height above sea level where stone replaces grass (optional)
+#
+# Noise parameters (all optional, with sensible defaults):
+#   height_scale: Terrain height multiplier (default 1.0, higher = taller terrain)
+#   base_height: Base height offset relative to sea level (default 0)
+#   noise_scale: Terrain noise frequency multiplier (default 1.0, higher = more jagged)
+#   detail_strength: Detail noise strength (default 0.25, 0 = smooth, higher = rougher)
+#   flatness: Terrain flatness (0.0 = normal, 1.0 = completely flat)
 
 [settings]
 # Scale for biome noise (smaller = larger biomes)
@@ -14,6 +21,7 @@ biome_scale = 0.005
 
 [biomes]
 
+# Plains - flat grasslands with gentle rolling hills
 [biomes.plains]
 temperature_min = -1.0
 temperature_max = 0.0
@@ -21,7 +29,13 @@ moisture_min = 0.0
 moisture_max = 1.0
 surface_block = "grass"
 subsurface_block = "dirt"
+height_scale = 0.5
+base_height = 0
+noise_scale = 0.8
+detail_strength = 0.15
+flatness = 0.4
 
+# Forest - slightly hilly terrain with moderate variation
 [biomes.forest]
 temperature_min = 0.0
 temperature_max = 1.0
@@ -29,7 +43,13 @@ moisture_min = 0.0
 moisture_max = 1.0
 surface_block = "grass"
 subsurface_block = "dirt"
+height_scale = 0.8
+base_height = 5
+noise_scale = 1.0
+detail_strength = 0.25
+flatness = 0.1
 
+# Desert - flat sandy dunes with occasional low hills
 [biomes.desert]
 temperature_min = 0.0
 temperature_max = 1.0
@@ -37,7 +57,13 @@ moisture_min = -1.0
 moisture_max = 0.0
 surface_block = "sand"
 subsurface_block = "sand"
+height_scale = 0.4
+base_height = -3
+noise_scale = 0.6
+detail_strength = 0.1
+flatness = 0.5
 
+# Mountains - tall, jagged peaks with high variation
 [biomes.mountains]
 temperature_min = -1.0
 temperature_max = -0.5
@@ -45,10 +71,14 @@ moisture_min = -1.0
 moisture_max = 0.0
 surface_block = "grass"
 subsurface_block = "dirt"
-# Above this height (relative to sea level), surface becomes stone
 stone_altitude = 20
+height_scale = 2.5
+base_height = 25
+noise_scale = 1.8
+detail_strength = 0.5
+flatness = 0.0
 
-# Tundra - cold, low moisture, snow-covered
+# Tundra - cold, relatively flat with some gentle hills
 [biomes.tundra]
 temperature_min = -1.0
 temperature_max = -0.5
@@ -56,8 +86,13 @@ moisture_min = 0.0
 moisture_max = 0.5
 surface_block = "snow"
 subsurface_block = "dirt"
+height_scale = 0.6
+base_height = 3
+noise_scale = 0.7
+detail_strength = 0.2
+flatness = 0.35
 
-# Taiga - cold coniferous forest
+# Taiga - cold coniferous forest with moderate hills
 [biomes.taiga]
 temperature_min = -0.5
 temperature_max = 0.0
@@ -65,8 +100,13 @@ moisture_min = -1.0
 moisture_max = 0.0
 surface_block = "podzol"
 subsurface_block = "dirt"
+height_scale = 0.9
+base_height = 8
+noise_scale = 1.1
+detail_strength = 0.3
+flatness = 0.15
 
-# Swamp - wet, temperate
+# Swamp - low-lying wet terrain, very flat
 [biomes.swamp]
 temperature_min = 0.0
 temperature_max = 0.5
@@ -74,8 +114,13 @@ moisture_min = 0.5
 moisture_max = 1.0
 surface_block = "grass"
 subsurface_block = "clay"
+height_scale = 0.3
+base_height = -2
+noise_scale = 0.5
+detail_strength = 0.1
+flatness = 0.7
 
-# Savanna - hot, dry grassland
+# Savanna - hot, dry grassland with gentle terrain
 [biomes.savanna]
 temperature_min = 0.5
 temperature_max = 1.0
@@ -83,8 +128,13 @@ moisture_min = -0.5
 moisture_max = 0.0
 surface_block = "grass"
 subsurface_block = "dirt"
+height_scale = 0.6
+base_height = 2
+noise_scale = 0.9
+detail_strength = 0.2
+flatness = 0.3
 
-# Beach - sandy shores (narrow temperature range near water)
+# Beach - sandy shores, very flat and low
 [biomes.beach]
 temperature_min = -0.5
 temperature_max = 0.5
@@ -92,8 +142,13 @@ moisture_min = -1.0
 moisture_max = -0.7
 surface_block = "sand"
 subsurface_block = "sand"
+height_scale = 0.2
+base_height = -5
+noise_scale = 0.4
+detail_strength = 0.05
+flatness = 0.8
 
-# Frozen ocean/ice plains
+# Ice Plains - frozen areas, flat with occasional ice formations
 [biomes.ice_plains]
 temperature_min = -1.0
 temperature_max = -0.5
@@ -101,3 +156,8 @@ moisture_min = 0.5
 moisture_max = 1.0
 surface_block = "snow"
 subsurface_block = "ice"
+height_scale = 0.4
+base_height = 0
+noise_scale = 0.6
+detail_strength = 0.15
+flatness = 0.5
