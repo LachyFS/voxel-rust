@@ -1,5 +1,11 @@
 # Texture configuration
 # Maps block types to their texture files
+#
+# Each block can have:
+#   all = "texture.png"              - Same texture on all faces
+#   top/bottom/sides = "texture.png" - Different textures per face
+#   random_rotation = true/false     - Randomize UV rotation per-face (default: false)
+#                                      Only applies to 1x1 faces (not greedy-merged quads)
 
 [blocks]
 
@@ -10,15 +16,19 @@ sides = "grass_side.png"
 
 [blocks.dirt]
 all = "dirt.png"
+random_rotation = true  # Natural variation for dirt
 
 [blocks.stone]
 all = "stone.png"
+random_rotation = true  # Break up repetitive stone patterns
 
 [blocks.cobblestone]
 all = "cobblestone.png"
+random_rotation = true  # Cobblestone looks better with random rotation
 
 [blocks.sand]
 all = "sand.png"
+random_rotation = true  # Natural sand variation
 
 [blocks.wood]
 top = "wood_top.png"
@@ -27,6 +37,7 @@ sides = "wood_side.png"
 
 [blocks.leaves]
 all = "leaves.png"
+random_rotation = true  # Leaves look more natural with variety
 
 [blocks.brick]
 all = "brick.png"

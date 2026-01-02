@@ -15,11 +15,15 @@ struct TextureConfig {
 enum BlockTextures {
     Uniform {
         all: String,
+        #[serde(default)]
+        random_rotation: bool,
     },
     PerFace {
         top: String,
         bottom: String,
         sides: String,
+        #[serde(default)]
+        random_rotation: bool,
     },
 }
 
@@ -29,6 +33,8 @@ pub struct BlockTextureIndices {
     pub top: u32,
     pub bottom: u32,
     pub sides: u32, // Used for left, right, front, back
+    /// If true, randomize UV rotation per-face based on position
+    pub random_rotation: bool,
 }
 
 /// Fast texture lookup array indexed by BlockType discriminant
@@ -61,10 +67,10 @@ impl TextureManager {
         let mut unique_files_set: HashSet<String> = HashSet::new();
         for block_tex in config.blocks.values() {
             match block_tex {
-                BlockTextures::Uniform { all } => {
+                BlockTextures::Uniform { all, .. } => {
                     unique_files_set.insert(all.clone());
                 }
-                BlockTextures::PerFace { top, bottom, sides } => {
+                BlockTextures::PerFace { top, bottom, sides, .. } => {
                     unique_files_set.insert(top.clone());
                     unique_files_set.insert(bottom.clone());
                     unique_files_set.insert(sides.clone());
@@ -101,18 +107,20 @@ impl TextureManager {
 
         for (block_name, block_tex) in &config.blocks {
             let indices = match block_tex {
-                BlockTextures::Uniform { all } => {
+                BlockTextures::Uniform { all, random_rotation } => {
                     let idx = texture_indices[all];
                     BlockTextureIndices {
                         top: idx,
                         bottom: idx,
                         sides: idx,
+                        random_rotation: *random_rotation,
                     }
                 }
-                BlockTextures::PerFace { top, bottom, sides } => BlockTextureIndices {
+                BlockTextures::PerFace { top, bottom, sides, random_rotation } => BlockTextureIndices {
                     top: texture_indices[top],
                     bottom: texture_indices[bottom],
                     sides: texture_indices[sides],
+                    random_rotation: *random_rotation,
                 },
             };
             block_textures.insert(block_name.clone(), indices);

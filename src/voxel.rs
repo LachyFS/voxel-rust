@@ -544,6 +544,11 @@ impl Chunk {
                     // Emit the merged quad
                     let (x, y, z) = coord_mapper(axis, row, col);
                     let pos = Vec3::new(x as f32, y as f32, z as f32) + chunk_offset;
+
+                    // Check if this block type has random rotation enabled
+                    let block = self.blocks[x][y][z];
+                    let random_rotation = texture_indices[block.as_index()].random_rotation;
+
                     add_greedy_face(
                         &mut self.mesh.vertices,
                         &mut self.mesh.indices,
@@ -552,6 +557,7 @@ impl Chunk {
                         face,
                         width,
                         height,
+                        random_rotation,
                     );
                 }
             }
@@ -676,7 +682,28 @@ fn add_face(
     tex_layer: u32,
     face: Face,
 ) {
-    add_greedy_face(vertices, indices, pos, tex_layer, face, 1, 1);
+    add_greedy_face(vertices, indices, pos, tex_layer, face, 1, 1, false);
+}
+
+/// Simple hash function for deterministic random rotation based on position
+#[inline]
+fn position_hash(x: i32, y: i32, z: i32, face: u8) -> u8 {
+    // Simple hash combining position and face for consistent rotation
+    let mut h = x.wrapping_mul(73856093) ^ y.wrapping_mul(19349663) ^ z.wrapping_mul(83492791);
+    h ^= (face as i32).wrapping_mul(48611);
+    (h & 3) as u8 // Returns 0, 1, 2, or 3 for 0°, 90°, 180°, 270° rotation
+}
+
+/// Rotate UV coordinates by 90 degrees * rotation_count
+#[inline]
+fn rotate_uv(uv: [f32; 2], rotation: u8, w: f32, h: f32) -> [f32; 2] {
+    match rotation & 3 {
+        0 => uv,                           // 0°
+        1 => [h - uv[1], uv[0]],          // 90° CCW: (u,v) -> (h-v, u)
+        2 => [w - uv[0], h - uv[1]],      // 180°: (u,v) -> (w-u, h-v)
+        3 => [uv[1], w - uv[0]],          // 270° CCW: (u,v) -> (v, w-u)
+        _ => unreachable!(),
+    }
 }
 
 /// Add a merged face from greedy meshing with proper UV tiling
@@ -689,10 +716,27 @@ fn add_greedy_face(
     face: Face,
     width: usize,
     height: usize,
+    random_rotation: bool,
 ) {
     let base_index = vertices.len() as u32;
     let w = width as f32;
     let h = height as f32;
+
+    // Calculate rotation if enabled (only for 1x1 faces to preserve tiling)
+    // For larger merged quads, rotation would break texture tiling
+    let rotation = if random_rotation && width == 1 && height == 1 {
+        let face_idx = match face {
+            Face::Top => 0,
+            Face::Bottom => 1,
+            Face::Left => 2,
+            Face::Right => 3,
+            Face::Front => 4,
+            Face::Back => 5,
+        };
+        position_hash(pos.x as i32, pos.y as i32, pos.z as i32, face_idx)
+    } else {
+        0
+    };
 
     // Position, UV, and normal for each face
     // UVs are scaled by width/height to tile the texture across merged faces
@@ -769,9 +813,15 @@ fn add_greedy_face(
     };
 
     for i in 0..4 {
+        // Apply rotation to UVs if enabled
+        let uv = if rotation > 0 {
+            rotate_uv(uvs[i], rotation, w, h)
+        } else {
+            uvs[i]
+        };
         vertices.push(Vertex {
             position: positions[i],
-            uv: uvs[i],
+            uv,
             normal,
             tex_layer,
         });
