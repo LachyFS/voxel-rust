@@ -327,7 +327,8 @@ impl Chunk {
         slice
     }
 
-    /// Generate mesh using extracted boundary data (for parallel processing)
+    /// Generate mesh using greedy meshing algorithm with extracted boundary data
+    /// Merges adjacent faces with the same texture into larger quads for efficiency
     pub fn generate_mesh_with_boundaries(
         &mut self,
         texture_indices: &BlockTextureArray,
@@ -347,81 +348,214 @@ impl Chunk {
             self.position[2] as f32 * CHUNK_SIZE as f32,
         );
 
-        for x in 0..CHUNK_SIZE {
-            for y in 0..CHUNK_SIZE {
-                for z in 0..CHUNK_SIZE {
+        // Process each axis direction with greedy meshing
+        // For each slice perpendicular to the axis, we build a 2D mask and merge faces
+
+        // +X faces (Right) - iterate over x slices, each slice is y-z plane
+        self.greedy_mesh_axis_with_boundaries(
+            texture_indices,
+            neighbors,
+            chunk_offset,
+            Face::Right,
+            |x, y, z| (x, y, z),  // coord mapper: axis, row, col -> x, y, z
+            |blocks, x, y, z| {
+                if x == CHUNK_SIZE - 1 {
+                    None // boundary case handled separately
+                } else {
+                    Some(!blocks[x + 1][y][z].is_solid())
+                }
+            },
+            |tex| tex.sides,
+        );
+
+        // -X faces (Left)
+        self.greedy_mesh_axis_with_boundaries(
+            texture_indices,
+            neighbors,
+            chunk_offset,
+            Face::Left,
+            |x, y, z| (x, y, z),
+            |blocks, x, y, z| {
+                if x == 0 {
+                    None
+                } else {
+                    Some(!blocks[x - 1][y][z].is_solid())
+                }
+            },
+            |tex| tex.sides,
+        );
+
+        // +Y faces (Top)
+        self.greedy_mesh_axis_with_boundaries(
+            texture_indices,
+            neighbors,
+            chunk_offset,
+            Face::Top,
+            |y, x, z| (x, y, z),  // axis=y, row=x, col=z
+            |blocks, x, y, z| {
+                if y == CHUNK_SIZE - 1 {
+                    None
+                } else {
+                    Some(!blocks[x][y + 1][z].is_solid())
+                }
+            },
+            |tex| tex.top,
+        );
+
+        // -Y faces (Bottom)
+        self.greedy_mesh_axis_with_boundaries(
+            texture_indices,
+            neighbors,
+            chunk_offset,
+            Face::Bottom,
+            |y, x, z| (x, y, z),
+            |blocks, x, y, z| {
+                if y == 0 {
+                    None
+                } else {
+                    Some(!blocks[x][y - 1][z].is_solid())
+                }
+            },
+            |tex| tex.bottom,
+        );
+
+        // +Z faces (Front)
+        self.greedy_mesh_axis_with_boundaries(
+            texture_indices,
+            neighbors,
+            chunk_offset,
+            Face::Front,
+            |z, x, y| (x, y, z),  // axis=z, row=x, col=y
+            |blocks, x, y, z| {
+                if z == CHUNK_SIZE - 1 {
+                    None
+                } else {
+                    Some(!blocks[x][y][z + 1].is_solid())
+                }
+            },
+            |tex| tex.sides,
+        );
+
+        // -Z faces (Back)
+        self.greedy_mesh_axis_with_boundaries(
+            texture_indices,
+            neighbors,
+            chunk_offset,
+            Face::Back,
+            |z, x, y| (x, y, z),
+            |blocks, x, y, z| {
+                if z == 0 {
+                    None
+                } else {
+                    Some(!blocks[x][y][z - 1].is_solid())
+                }
+            },
+            |tex| tex.sides,
+        );
+
+        self.mesh.dirty = false;
+    }
+
+    /// Greedy mesh one face direction across all slices
+    fn greedy_mesh_axis_with_boundaries<F, G, T>(
+        &mut self,
+        texture_indices: &BlockTextureArray,
+        neighbors: &BoundaryNeighbors,
+        chunk_offset: Vec3,
+        face: Face,
+        coord_mapper: F,
+        should_render_internal: G,
+        get_texture: T,
+    ) where
+        F: Fn(usize, usize, usize) -> (usize, usize, usize),
+        G: Fn(&[[[BlockType; CHUNK_SIZE]; CHUNK_SIZE]; CHUNK_SIZE], usize, usize, usize) -> Option<bool>,
+        T: Fn(&crate::texture::BlockTextureIndices) -> u32,
+    {
+        // Mask stores texture layer for each cell, 0 means no face
+        // We use u32::MAX as "no face" marker since 0 could be a valid texture
+        const NO_FACE: u32 = u32::MAX;
+        let mut mask = [[NO_FACE; CHUNK_SIZE]; CHUNK_SIZE];
+
+        for axis in 0..CHUNK_SIZE {
+            // Build mask for this slice
+            for row in 0..CHUNK_SIZE {
+                for col in 0..CHUNK_SIZE {
+                    let (x, y, z) = coord_mapper(axis, row, col);
                     let block = self.blocks[x][y][z];
+
                     if !block.is_solid() {
+                        mask[row][col] = NO_FACE;
                         continue;
                     }
 
-                    let pos = Vec3::new(x as f32, y as f32, z as f32) + chunk_offset;
-                    let tex = &texture_indices[block.as_index()];
-
-                    // +X face (Right)
-                    let should_render_pos_x = if x == CHUNK_SIZE - 1 {
-                        !neighbors.is_solid_at(Face::Right, x, y, z)
-                    } else {
-                        !self.blocks[x + 1][y][z].is_solid()
+                    // Check if face should render
+                    let should_render = match should_render_internal(&self.blocks, x, y, z) {
+                        Some(result) => result,
+                        None => !neighbors.is_solid_at(face, x, y, z), // boundary case
                     };
-                    if should_render_pos_x {
-                        add_face(&mut self.mesh.vertices, &mut self.mesh.indices, pos, tex.sides, Face::Right);
-                    }
 
-                    // -X face (Left)
-                    let should_render_neg_x = if x == 0 {
-                        !neighbors.is_solid_at(Face::Left, x, y, z)
+                    if should_render {
+                        let tex = &texture_indices[block.as_index()];
+                        mask[row][col] = get_texture(tex);
                     } else {
-                        !self.blocks[x - 1][y][z].is_solid()
-                    };
-                    if should_render_neg_x {
-                        add_face(&mut self.mesh.vertices, &mut self.mesh.indices, pos, tex.sides, Face::Left);
-                    }
-
-                    // +Y face (Top)
-                    let should_render_pos_y = if y == CHUNK_SIZE - 1 {
-                        !neighbors.is_solid_at(Face::Top, x, y, z)
-                    } else {
-                        !self.blocks[x][y + 1][z].is_solid()
-                    };
-                    if should_render_pos_y {
-                        add_face(&mut self.mesh.vertices, &mut self.mesh.indices, pos, tex.top, Face::Top);
-                    }
-
-                    // -Y face (Bottom)
-                    let should_render_neg_y = if y == 0 {
-                        !neighbors.is_solid_at(Face::Bottom, x, y, z)
-                    } else {
-                        !self.blocks[x][y - 1][z].is_solid()
-                    };
-                    if should_render_neg_y {
-                        add_face(&mut self.mesh.vertices, &mut self.mesh.indices, pos, tex.bottom, Face::Bottom);
-                    }
-
-                    // +Z face (Front)
-                    let should_render_pos_z = if z == CHUNK_SIZE - 1 {
-                        !neighbors.is_solid_at(Face::Front, x, y, z)
-                    } else {
-                        !self.blocks[x][y][z + 1].is_solid()
-                    };
-                    if should_render_pos_z {
-                        add_face(&mut self.mesh.vertices, &mut self.mesh.indices, pos, tex.sides, Face::Front);
-                    }
-
-                    // -Z face (Back)
-                    let should_render_neg_z = if z == 0 {
-                        !neighbors.is_solid_at(Face::Back, x, y, z)
-                    } else {
-                        !self.blocks[x][y][z - 1].is_solid()
-                    };
-                    if should_render_neg_z {
-                        add_face(&mut self.mesh.vertices, &mut self.mesh.indices, pos, tex.sides, Face::Back);
+                        mask[row][col] = NO_FACE;
                     }
                 }
             }
-        }
 
-        self.mesh.dirty = false;
+            // Greedy merge the mask into quads
+            let mut processed = [[false; CHUNK_SIZE]; CHUNK_SIZE];
+
+            for row in 0..CHUNK_SIZE {
+                for col in 0..CHUNK_SIZE {
+                    if processed[row][col] || mask[row][col] == NO_FACE {
+                        continue;
+                    }
+
+                    let tex_layer = mask[row][col];
+
+                    // Find width (extend along col)
+                    let mut width = 1;
+                    while col + width < CHUNK_SIZE
+                        && !processed[row][col + width]
+                        && mask[row][col + width] == tex_layer
+                    {
+                        width += 1;
+                    }
+
+                    // Find height (extend along row)
+                    let mut height = 1;
+                    'height: while row + height < CHUNK_SIZE {
+                        for c in col..col + width {
+                            if processed[row + height][c] || mask[row + height][c] != tex_layer {
+                                break 'height;
+                            }
+                        }
+                        height += 1;
+                    }
+
+                    // Mark cells as processed
+                    for r in row..row + height {
+                        for c in col..col + width {
+                            processed[r][c] = true;
+                        }
+                    }
+
+                    // Emit the merged quad
+                    let (x, y, z) = coord_mapper(axis, row, col);
+                    let pos = Vec3::new(x as f32, y as f32, z as f32) + chunk_offset;
+                    add_greedy_face(
+                        &mut self.mesh.vertices,
+                        &mut self.mesh.indices,
+                        pos,
+                        tex_layer,
+                        face,
+                        width,
+                        height,
+                    );
+                }
+            }
+        }
     }
 
     /// Generate mesh with neighbor-aware culling and cache it
@@ -534,6 +668,7 @@ pub enum Face {
     Back,
 }
 
+/// Add a single 1x1 face (used by non-greedy meshing)
 fn add_face(
     vertices: &mut Vec<Vertex>,
     indices: &mut Vec<u32>,
@@ -541,69 +676,94 @@ fn add_face(
     tex_layer: u32,
     face: Face,
 ) {
+    add_greedy_face(vertices, indices, pos, tex_layer, face, 1, 1);
+}
+
+/// Add a merged face from greedy meshing with proper UV tiling
+/// width and height are in blocks; UVs are scaled to tile the texture
+fn add_greedy_face(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    pos: Vec3,
+    tex_layer: u32,
+    face: Face,
+    width: usize,
+    height: usize,
+) {
     let base_index = vertices.len() as u32;
+    let w = width as f32;
+    let h = height as f32;
 
     // Position, UV, and normal for each face
-    // UVs are 0-1 for a single voxel; will tile properly with greedy meshing
+    // UVs are scaled by width/height to tile the texture across merged faces
+    // The width/height dimensions depend on the face orientation:
+    // - For axis-aligned faces, "width" extends along one axis, "height" along another
+    // - We need to map row/col from greedy meshing to the correct world axes
     let (positions, uvs, normal) = match face {
+        // Top/Bottom: greedy mesh iterates axis=Y, row=X, col=Z
+        // So width extends along Z, height extends along X
         Face::Top => (
             [
-                [pos.x, pos.y + 1.0, pos.z + 1.0],
-                [pos.x + 1.0, pos.y + 1.0, pos.z + 1.0],
-                [pos.x + 1.0, pos.y + 1.0, pos.z],
-                [pos.x, pos.y + 1.0, pos.z],
+                [pos.x, pos.y + 1.0, pos.z + w],           // row, col+w
+                [pos.x + h, pos.y + 1.0, pos.z + w],       // row+h, col+w
+                [pos.x + h, pos.y + 1.0, pos.z],           // row+h, col
+                [pos.x, pos.y + 1.0, pos.z],               // row, col
             ],
-            [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+            [[0.0, w], [h, w], [h, 0.0], [0.0, 0.0]],
             [0.0, 1.0, 0.0],
         ),
         Face::Bottom => (
             [
                 [pos.x, pos.y, pos.z],
-                [pos.x + 1.0, pos.y, pos.z],
-                [pos.x + 1.0, pos.y, pos.z + 1.0],
-                [pos.x, pos.y, pos.z + 1.0],
+                [pos.x + h, pos.y, pos.z],
+                [pos.x + h, pos.y, pos.z + w],
+                [pos.x, pos.y, pos.z + w],
             ],
-            [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            [[0.0, 0.0], [h, 0.0], [h, w], [0.0, w]],
             [0.0, -1.0, 0.0],
         ),
+        // Left/Right: greedy mesh iterates axis=X, row=Y, col=Z
+        // So width extends along Z, height extends along Y
         Face::Left => (
             [
                 [pos.x, pos.y, pos.z],
-                [pos.x, pos.y, pos.z + 1.0],
-                [pos.x, pos.y + 1.0, pos.z + 1.0],
-                [pos.x, pos.y + 1.0, pos.z],
+                [pos.x, pos.y, pos.z + w],
+                [pos.x, pos.y + h, pos.z + w],
+                [pos.x, pos.y + h, pos.z],
             ],
-            [[1.0, 1.0], [0.0, 1.0], [0.0, 0.0], [1.0, 0.0]],
+            [[w, h], [0.0, h], [0.0, 0.0], [w, 0.0]],
             [-1.0, 0.0, 0.0],
         ),
         Face::Right => (
             [
-                [pos.x + 1.0, pos.y, pos.z + 1.0],
+                [pos.x + 1.0, pos.y, pos.z + w],
                 [pos.x + 1.0, pos.y, pos.z],
-                [pos.x + 1.0, pos.y + 1.0, pos.z],
-                [pos.x + 1.0, pos.y + 1.0, pos.z + 1.0],
+                [pos.x + 1.0, pos.y + h, pos.z],
+                [pos.x + 1.0, pos.y + h, pos.z + w],
             ],
-            [[1.0, 1.0], [0.0, 1.0], [0.0, 0.0], [1.0, 0.0]],
+            [[w, h], [0.0, h], [0.0, 0.0], [w, 0.0]],
             [1.0, 0.0, 0.0],
         ),
+        // Front/Back: greedy mesh iterates axis=Z, row=X, col=Y
+        // So width extends along Y, height extends along X
         Face::Front => (
             [
                 [pos.x, pos.y, pos.z + 1.0],
-                [pos.x + 1.0, pos.y, pos.z + 1.0],
-                [pos.x + 1.0, pos.y + 1.0, pos.z + 1.0],
-                [pos.x, pos.y + 1.0, pos.z + 1.0],
+                [pos.x + h, pos.y, pos.z + 1.0],
+                [pos.x + h, pos.y + w, pos.z + 1.0],
+                [pos.x, pos.y + w, pos.z + 1.0],
             ],
-            [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+            [[0.0, w], [h, w], [h, 0.0], [0.0, 0.0]],
             [0.0, 0.0, 1.0],
         ),
         Face::Back => (
             [
-                [pos.x + 1.0, pos.y, pos.z],
+                [pos.x + h, pos.y, pos.z],
                 [pos.x, pos.y, pos.z],
-                [pos.x, pos.y + 1.0, pos.z],
-                [pos.x + 1.0, pos.y + 1.0, pos.z],
+                [pos.x, pos.y + w, pos.z],
+                [pos.x + h, pos.y + w, pos.z],
             ],
-            [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+            [[0.0, w], [h, w], [h, 0.0], [0.0, 0.0]],
             [0.0, 0.0, -1.0],
         ),
     };
