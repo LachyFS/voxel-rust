@@ -20,6 +20,9 @@ const STRUCTURE_CHECK_RADIUS: i32 = 5;
 enum StructureType {
     OakTree,
     Cactus,
+    SpruceTree,
+    DeadBush,
+    TallGrass,
 }
 
 /// A block placement within a structure, relative to spawn point
@@ -36,6 +39,9 @@ fn get_structure_blocks(structure_type: StructureType) -> &'static [StructureBlo
     match structure_type {
         StructureType::OakTree => &OAK_TREE_BLOCKS,
         StructureType::Cactus => &CACTUS_BLOCKS,
+        StructureType::SpruceTree => &SPRUCE_TREE_BLOCKS,
+        StructureType::DeadBush => &DEAD_BUSH_BLOCKS,
+        StructureType::TallGrass => &TALL_GRASS_BLOCKS,
     }
 }
 
@@ -57,7 +63,7 @@ static OAK_TREE_BLOCKS: [StructureBlock; 31] = [
     StructureBlock { dx: -1, dy: 4, dz: 0, block: BlockType::Leaves },
     StructureBlock { dx: -1, dy: 4, dz: 1, block: BlockType::Leaves },
     StructureBlock { dx: 0, dy: 4, dz: -1, block: BlockType::Leaves },
-    // trunk at (0,4,0) - already added above
+    // trunk at (0, 4,0) - already added above
     StructureBlock { dx: 0, dy: 4, dz: 1, block: BlockType::Leaves },
     StructureBlock { dx: 1, dy: 4, dz: -1, block: BlockType::Leaves },
     StructureBlock { dx: 1, dy: 4, dz: 0, block: BlockType::Leaves },
@@ -82,9 +88,71 @@ static OAK_TREE_BLOCKS: [StructureBlock; 31] = [
 
 /// Cactus: 3 blocks tall
 static CACTUS_BLOCKS: [StructureBlock; 3] = [
-    StructureBlock { dx: 0, dy: 0, dz: 0, block: BlockType::Leaves }, // Using Leaves as cactus placeholder
-    StructureBlock { dx: 0, dy: 1, dz: 0, block: BlockType::Leaves },
-    StructureBlock { dx: 0, dy: 2, dz: 0, block: BlockType::Leaves },
+    StructureBlock { dx: 0, dy: 0, dz: 0, block: BlockType::Cactus },
+    StructureBlock { dx: 0, dy: 1, dz: 0, block: BlockType::Cactus },
+    StructureBlock { dx: 0, dy: 2, dz: 0, block: BlockType::Cactus },
+];
+
+/// Spruce tree: 7 blocks tall trunk with triangular canopy
+static SPRUCE_TREE_BLOCKS: [StructureBlock; 40] = [
+    // Trunk (7 blocks, y=0 to y=6)
+    StructureBlock { dx: 0, dy: 0, dz: 0, block: BlockType::SpruceWood },
+    StructureBlock { dx: 0, dy: 1, dz: 0, block: BlockType::SpruceWood },
+    StructureBlock { dx: 0, dy: 2, dz: 0, block: BlockType::SpruceWood },
+    StructureBlock { dx: 0, dy: 3, dz: 0, block: BlockType::SpruceWood },
+    StructureBlock { dx: 0, dy: 4, dz: 0, block: BlockType::SpruceWood },
+    StructureBlock { dx: 0, dy: 5, dz: 0, block: BlockType::SpruceWood },
+    StructureBlock { dx: 0, dy: 6, dz: 0, block: BlockType::SpruceWood },
+    // Bottom layer (y=2, 3x3 cross)
+    StructureBlock { dx: -1, dy: 2, dz: 0, block: BlockType::SpruceLeaves },
+    StructureBlock { dx: 1, dy: 2, dz: 0, block: BlockType::SpruceLeaves },
+    StructureBlock { dx: 0, dy: 2, dz: -1, block: BlockType::SpruceLeaves },
+    StructureBlock { dx: 0, dy: 2, dz: 1, block: BlockType::SpruceLeaves },
+    StructureBlock { dx: -2, dy: 2, dz: 0, block: BlockType::SpruceLeaves },
+    StructureBlock { dx: 2, dy: 2, dz: 0, block: BlockType::SpruceLeaves },
+    StructureBlock { dx: 0, dy: 2, dz: -2, block: BlockType::SpruceLeaves },
+    StructureBlock { dx: 0, dy: 2, dz: 2, block: BlockType::SpruceLeaves },
+    // Layer 2 (y=3, smaller)
+    StructureBlock { dx: -1, dy: 3, dz: 0, block: BlockType::SpruceLeaves },
+    StructureBlock { dx: 1, dy: 3, dz: 0, block: BlockType::SpruceLeaves },
+    StructureBlock { dx: 0, dy: 3, dz: -1, block: BlockType::SpruceLeaves },
+    StructureBlock { dx: 0, dy: 3, dz: 1, block: BlockType::SpruceLeaves },
+    // Layer 3 (y=4, cross)
+    StructureBlock { dx: -1, dy: 4, dz: 0, block: BlockType::SpruceLeaves },
+    StructureBlock { dx: 1, dy: 4, dz: 0, block: BlockType::SpruceLeaves },
+    StructureBlock { dx: 0, dy: 4, dz: -1, block: BlockType::SpruceLeaves },
+    StructureBlock { dx: 0, dy: 4, dz: 1, block: BlockType::SpruceLeaves },
+    StructureBlock { dx: -1, dy: 4, dz: -1, block: BlockType::SpruceLeaves },
+    StructureBlock { dx: -1, dy: 4, dz: 1, block: BlockType::SpruceLeaves },
+    StructureBlock { dx: 1, dy: 4, dz: -1, block: BlockType::SpruceLeaves },
+    StructureBlock { dx: 1, dy: 4, dz: 1, block: BlockType::SpruceLeaves },
+    // Layer 4 (y=5, smaller)
+    StructureBlock { dx: -1, dy: 5, dz: 0, block: BlockType::SpruceLeaves },
+    StructureBlock { dx: 1, dy: 5, dz: 0, block: BlockType::SpruceLeaves },
+    StructureBlock { dx: 0, dy: 5, dz: -1, block: BlockType::SpruceLeaves },
+    StructureBlock { dx: 0, dy: 5, dz: 1, block: BlockType::SpruceLeaves },
+    // Layer 5 (y=6, cross around trunk)
+    StructureBlock { dx: -1, dy: 6, dz: 0, block: BlockType::SpruceLeaves },
+    StructureBlock { dx: 1, dy: 6, dz: 0, block: BlockType::SpruceLeaves },
+    StructureBlock { dx: 0, dy: 6, dz: -1, block: BlockType::SpruceLeaves },
+    StructureBlock { dx: 0, dy: 6, dz: 1, block: BlockType::SpruceLeaves },
+    // Top (y=7, single block)
+    StructureBlock { dx: 0, dy: 7, dz: 0, block: BlockType::SpruceLeaves },
+    // Extra corner leaves at y=6
+    StructureBlock { dx: -1, dy: 6, dz: -1, block: BlockType::SpruceLeaves },
+    StructureBlock { dx: -1, dy: 6, dz: 1, block: BlockType::SpruceLeaves },
+    StructureBlock { dx: 1, dy: 6, dz: -1, block: BlockType::SpruceLeaves },
+    StructureBlock { dx: 1, dy: 6, dz: 1, block: BlockType::SpruceLeaves },
+];
+
+/// Dead bush: single block
+static DEAD_BUSH_BLOCKS: [StructureBlock; 1] = [
+    StructureBlock { dx: 0, dy: 0, dz: 0, block: BlockType::DeadBush },
+];
+
+/// Tall grass: single block
+static TALL_GRASS_BLOCKS: [StructureBlock; 1] = [
+    StructureBlock { dx: 0, dy: 0, dz: 0, block: BlockType::TallGrass },
 ];
 
 /// Deterministic hash for structure spawn decisions
@@ -333,17 +401,71 @@ impl WorldGenerator {
                 if hash < 8 {
                     return Some(StructureType::OakTree);
                 }
+                // Tall grass in forests
+                if hash >= 8 && hash < 25 {
+                    return Some(StructureType::TallGrass);
+                }
             }
             "plains" => {
                 // Lower tree density in plains (hash < 2 = ~0.8% chance)
                 if hash < 2 {
                     return Some(StructureType::OakTree);
                 }
+                // Tall grass scattered in plains
+                if hash >= 2 && hash < 15 {
+                    return Some(StructureType::TallGrass);
+                }
             }
             "desert" => {
                 // Cacti in deserts (hash < 4 = ~1.5% chance)
                 if hash < 4 {
                     return Some(StructureType::Cactus);
+                }
+                // Dead bushes in deserts
+                if hash >= 4 && hash < 12 {
+                    return Some(StructureType::DeadBush);
+                }
+            }
+            "taiga" => {
+                // Spruce trees in taiga (hash < 10 = ~4% chance)
+                if hash < 10 {
+                    return Some(StructureType::SpruceTree);
+                }
+            }
+            "swamp" => {
+                // Oak trees in swamp (lower density)
+                if hash < 5 {
+                    return Some(StructureType::OakTree);
+                }
+                // Tall grass in swamps
+                if hash >= 5 && hash < 20 {
+                    return Some(StructureType::TallGrass);
+                }
+            }
+            "savanna" => {
+                // Sparse oak trees in savanna
+                if hash < 2 {
+                    return Some(StructureType::OakTree);
+                }
+                // Tall grass in savanna
+                if hash >= 2 && hash < 18 {
+                    return Some(StructureType::TallGrass);
+                }
+                // Dead bushes scattered
+                if hash >= 18 && hash < 22 {
+                    return Some(StructureType::DeadBush);
+                }
+            }
+            "tundra" | "ice_plains" => {
+                // Very sparse vegetation in tundra
+                if hash < 3 {
+                    return Some(StructureType::DeadBush);
+                }
+            }
+            "mountains" => {
+                // Sparse trees at lower altitudes
+                if hash < 3 && surface_height < self.config.sea_level + 25 {
+                    return Some(StructureType::OakTree);
                 }
             }
             _ => {}
@@ -363,8 +485,8 @@ impl WorldGenerator {
     ) -> HashMap<(i32, i32, i32), BlockType> {
         let mut structure_blocks = HashMap::new();
 
-        // Maximum structure height (oak tree is tallest at 7 blocks)
-        const MAX_STRUCTURE_HEIGHT: i32 = 7;
+        // Maximum structure height (spruce tree is tallest at 8 blocks)
+        const MAX_STRUCTURE_HEIGHT: i32 = 8;
 
         // Check spawn points in a region that could place blocks inside this chunk
         // We need to check spawn points outside the chunk that could have structures
@@ -582,7 +704,6 @@ impl World {
             return false;
         }
 
-        log::debug!("Player moved to chunk ({}, {})", player_cx, player_cz);
         self.last_player_chunk = Some((player_cx, player_cz));
 
         let mut changed = false;

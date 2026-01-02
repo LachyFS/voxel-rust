@@ -44,3 +44,43 @@ all = "brick.png"
 
 [blocks.water]
 all = "water.png"
+
+[blocks.snow]
+all = "snow.png"
+random_rotation = true
+
+[blocks.ice]
+all = "ice.png"
+
+[blocks.gravel]
+all = "gravel.png"
+random_rotation = true
+
+[blocks.clay]
+all = "clay.png"
+random_rotation = true
+
+[blocks.cactus]
+top = "cactus_top.png"
+bottom = "cactus_top.png"
+sides = "cactus_side.png"
+
+[blocks.dead_bush]
+all = "dead_bush.png"
+
+[blocks.tall_grass]
+all = "tall_grass.png"
+
+[blocks.podzol]
+top = "podzol_top.png"
+bottom = "dirt.png"
+sides = "podzol_side.png"
+
+[blocks.spruce_wood]
+top = "spruce_wood_top.png"
+bottom = "spruce_wood_top.png"
+sides = "spruce_wood_side.png"
+
+[blocks.spruce_leaves]
+all = "spruce_leaves.png"
+random_rotation = true

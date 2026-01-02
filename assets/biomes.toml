@@ -40,10 +40,64 @@ subsurface_block = "sand"
 
 [biomes.mountains]
 temperature_min = -1.0
-temperature_max = 0.0
+temperature_max = -0.5
 moisture_min = -1.0
 moisture_max = 0.0
 surface_block = "grass"
 subsurface_block = "dirt"
 # Above this height (relative to sea level), surface becomes stone
 stone_altitude = 20
+
+# Tundra - cold, low moisture, snow-covered
+[biomes.tundra]
+temperature_min = -1.0
+temperature_max = -0.5
+moisture_min = 0.0
+moisture_max = 0.5
+surface_block = "snow"
+subsurface_block = "dirt"
+
+# Taiga - cold coniferous forest
+[biomes.taiga]
+temperature_min = -0.5
+temperature_max = 0.0
+moisture_min = -1.0
+moisture_max = 0.0
+surface_block = "podzol"
+subsurface_block = "dirt"
+
+# Swamp - wet, temperate
+[biomes.swamp]
+temperature_min = 0.0
+temperature_max = 0.5
+moisture_min = 0.5
+moisture_max = 1.0
+surface_block = "grass"
+subsurface_block = "clay"
+
+# Savanna - hot, dry grassland
+[biomes.savanna]
+temperature_min = 0.5
+temperature_max = 1.0
+moisture_min = -0.5
+moisture_max = 0.0
+surface_block = "grass"
+subsurface_block = "dirt"
+
+# Beach - sandy shores (narrow temperature range near water)
+[biomes.beach]
+temperature_min = -0.5
+temperature_max = 0.5
+moisture_min = -1.0
+moisture_max = -0.7
+surface_block = "sand"
+subsurface_block = "sand"
+
+# Frozen ocean/ice plains
+[biomes.ice_plains]
+temperature_min = -1.0
+temperature_max = -0.5
+moisture_min = 0.5
+moisture_max = 1.0
+surface_block = "snow"
+subsurface_block = "ice"

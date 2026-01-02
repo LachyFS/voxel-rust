@@ -218,6 +218,16 @@ fn parse_block_type(name: &str) -> BlockType {
         "leaves" => BlockType::Leaves,
         "brick" => BlockType::Brick,
         "water" => BlockType::Water,
+        "snow" => BlockType::Snow,
+        "ice" => BlockType::Ice,
+        "gravel" => BlockType::Gravel,
+        "clay" => BlockType::Clay,
+        "cactus" => BlockType::Cactus,
+        "dead_bush" => BlockType::DeadBush,
+        "tall_grass" => BlockType::TallGrass,
+        "podzol" => BlockType::Podzol,
+        "spruce_wood" => BlockType::SpruceWood,
+        "spruce_leaves" => BlockType::SpruceLeaves,
         _ => {
             log::warn!("Unknown block type '{}', defaulting to Stone", name);
             BlockType::Stone

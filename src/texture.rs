@@ -39,7 +39,7 @@ pub struct BlockTextureIndices {
 
 /// Fast texture lookup array indexed by BlockType discriminant
 /// Avoids HashMap lookups during mesh generation
-pub type BlockTextureArray = [BlockTextureIndices; 10]; // BlockType::COUNT
+pub type BlockTextureArray = [BlockTextureIndices; 20]; // BlockType::COUNT
 
 /// Manages texture loading and the texture array
 pub struct TextureManager {
@@ -149,7 +149,7 @@ impl TextureManager {
     pub fn create_texture_array_lookup(&self) -> BlockTextureArray {
         use crate::voxel::BlockType;
 
-        let mut array = [BlockTextureIndices::default(); 10];
+        let mut array = [BlockTextureIndices::default(); 20];
 
         // Map each block type to its texture indices
         let mappings = [
@@ -163,6 +163,16 @@ impl TextureManager {
             (BlockType::Leaves, "leaves"),
             (BlockType::Brick, "brick"),
             (BlockType::Water, "water"),
+            (BlockType::Snow, "snow"),
+            (BlockType::Ice, "ice"),
+            (BlockType::Gravel, "gravel"),
+            (BlockType::Clay, "clay"),
+            (BlockType::Cactus, "cactus"),
+            (BlockType::DeadBush, "dead_bush"),
+            (BlockType::TallGrass, "tall_grass"),
+            (BlockType::Podzol, "podzol"),
+            (BlockType::SpruceWood, "spruce_wood"),
+            (BlockType::SpruceLeaves, "spruce_leaves"),
         ];
 
         for (block_type, name) in mappings {

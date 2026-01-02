@@ -173,17 +173,22 @@ impl ApplicationHandler for App {
                     self.frame_count = 0;
                     self.fps_timer = Instant::now();
 
-                    // Update window title with FPS
+                    // Update window title with FPS and time of day
                     if let Some(window) = &self.window {
-                        window.set_title(&format!("Voxel World - {:.0} FPS", self.current_fps));
+                        let time_str = self.renderer.as_ref()
+                            .map(|r| r.get_time_string())
+                            .unwrap_or_default();
+                        window.set_title(&format!("Voxel World - {:.0} FPS - {}", self.current_fps, time_str));
                     }
                 }
 
                 // Update camera
                 if let Some(camera) = &mut self.camera {
                     self.camera_controller.update_camera(camera, dt);
-                    if let Some(renderer) = &self.renderer {
+                    if let Some(renderer) = &mut self.renderer {
                         renderer.update_camera(camera);
+                        // Update time of day and lighting
+                        renderer.update_time(dt, camera.position);
                     }
 
                     // Update world chunks based on player position

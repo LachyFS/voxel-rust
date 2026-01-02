@@ -46,11 +46,21 @@ pub enum BlockType {
     Leaves = 7,
     Brick = 8,
     Water = 9,
+    Snow = 10,
+    Ice = 11,
+    Gravel = 12,
+    Clay = 13,
+    Cactus = 14,
+    DeadBush = 15,
+    TallGrass = 16,
+    Podzol = 17,
+    SpruceWood = 18,
+    SpruceLeaves = 19,
 }
 
 impl BlockType {
     /// Total number of block types (for array indexing)
-    pub const COUNT: usize = 10;
+    pub const COUNT: usize = 20;
 
     /// Convert to array index for direct texture lookup
     #[inline]
@@ -65,7 +75,16 @@ impl BlockType {
     }
 
     pub fn is_transparent(&self) -> bool {
-        matches!(self, BlockType::Air | BlockType::Water | BlockType::Leaves)
+        matches!(
+            self,
+            BlockType::Air
+                | BlockType::Water
+                | BlockType::Leaves
+                | BlockType::SpruceLeaves
+                | BlockType::Ice
+                | BlockType::DeadBush
+                | BlockType::TallGrass
+        )
     }
 
     /// Determine if a face should be rendered between current block and adjacent block
@@ -108,6 +127,16 @@ impl BlockType {
             BlockType::Leaves => "leaves",
             BlockType::Brick => "brick",
             BlockType::Water => "water",
+            BlockType::Snow => "snow",
+            BlockType::Ice => "ice",
+            BlockType::Gravel => "gravel",
+            BlockType::Clay => "clay",
+            BlockType::Cactus => "cactus",
+            BlockType::DeadBush => "dead_bush",
+            BlockType::TallGrass => "tall_grass",
+            BlockType::Podzol => "podzol",
+            BlockType::SpruceWood => "spruce_wood",
+            BlockType::SpruceLeaves => "spruce_leaves",
         }
     }
 }
@@ -430,8 +459,8 @@ impl Chunk {
             neighbors,
             chunk_offset,
             Face::Top,
-            |y, x, z| (x, y, z),  // axis=y, row=x, col=z
-            |blocks, x, y, z| {
+            |y: usize, x: usize, z: usize| (x, y, z),  // axis=y, row=x, col=z
+            |blocks: &[[[BlockType; 16]; 16]; 16], x, y, z| {
                 if y == CHUNK_SIZE - 1 {
                     None
                 } else {
