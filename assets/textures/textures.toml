@@ -1,0 +1,35 @@
+# Texture configuration
+# Maps block types to their texture files
+
+[blocks]
+
+[blocks.grass]
+top = "grass_top.png"
+bottom = "dirt.png"
+sides = "grass_side.png"
+
+[blocks.dirt]
+all = "dirt.png"
+
+[blocks.stone]
+all = "stone.png"
+
+[blocks.cobblestone]
+all = "cobblestone.png"
+
+[blocks.sand]
+all = "sand.png"
+
+[blocks.wood]
+top = "wood_top.png"
+bottom = "wood_top.png"
+sides = "wood_side.png"
+
+[blocks.leaves]
+all = "leaves.png"
+
+[blocks.brick]
+all = "brick.png"
+
+[blocks.water]
+all = "water.png"

@@ -1,0 +1,30 @@
+[package]
+name = "voxel-rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wgpu = "23"
+winit = "0.30"
+glam = "0.29"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+env_logger = "0.11"
+log = "0.4"
+image = "0.24"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+noise = "0.9"
+rand = "0.8"
+rayon = "1.10"
+
+[[bin]]
+name = "voxel-rust"
+path = "src/main.rs"
+
+[[bin]]
+name = "generate-textures"
+path = "src/bin/generate_textures.rs"
+
+[profile.release]
+debug = true  # Enable debug symbols for flamegraph

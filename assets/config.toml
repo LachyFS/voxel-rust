@@ -1,0 +1,43 @@
+# Voxel World Configuration
+
+[rendering]
+# Horizontal render distance in chunks (each chunk is 16 blocks)
+# Higher values = more visible terrain, but more memory and GPU usage
+render_distance = 4
+
+# Vertical render distance in chunks
+height_chunks = 4
+
+[terrain]
+# World generation seed (same seed = same world)
+seed = 42
+
+# Sea level height in blocks
+sea_level = 32
+
+# Terrain noise scale (smaller = more spread out features)
+terrain_scale = 0.02
+
+# Maximum terrain height variation in blocks
+terrain_height = 32.0
+
+# Cave generation scale (smaller = larger caves)
+cave_scale = 0.08
+
+# Cave threshold (higher = fewer caves, 0.0-1.0)
+cave_threshold = 0.55
+
+[camera]
+# Movement speed (blocks per second)
+movement_speed = 20.0
+
+# Mouse sensitivity
+mouse_sensitivity = 0.003
+
+# Starting position
+start_x = 32.0
+start_y = 80.0
+start_z = 32.0
+
+# Starting pitch (degrees, negative = looking down)
+start_pitch = -30.0
