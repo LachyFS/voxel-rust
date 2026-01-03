@@ -5,6 +5,7 @@ use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 use crate::camera::{Camera, CameraUniform, Frustum};
+use crate::raycast::RaycastHit;
 use crate::texture::{BlockTextureArray, TextureManager};
 use crate::voxel::Vertex;
 use crate::worldgen::World;
@@ -53,6 +54,143 @@ impl SkyUniform {
         self.camera_position = camera.position.to_array();
         self.viewport_size = [viewport_width, viewport_height];
     }
+}
+
+/// Selection box uniform for highlighting selected blocks
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct SelectionUniform {
+    block_pos: [f32; 3],
+    line_thickness: f32,
+    color: [f32; 4],
+}
+
+impl SelectionUniform {
+    pub fn new() -> Self {
+        Self {
+            block_pos: [0.0, 0.0, 0.0],
+            line_thickness: 0.0, // Unused, kept for struct alignment
+            color: [0.05, 0.05, 0.05, 1.0], // Very dark gray, fully opaque
+        }
+    }
+
+    pub fn update(&mut self, hit: &RaycastHit, _time: f32) {
+        self.block_pos = [
+            hit.block_pos[0] as f32,
+            hit.block_pos[1] as f32,
+            hit.block_pos[2] as f32,
+        ];
+        // Very dark gray, almost black
+        self.color = [0.05, 0.05, 0.05, 1.0];
+    }
+}
+
+/// Simple vertex for selection box (just position)
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct SelectionVertex {
+    pub position: [f32; 3],
+}
+
+impl SelectionVertex {
+    const ATTRIBS: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![
+        0 => Float32x3,  // position
+    ];
+
+    pub fn desc() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<SelectionVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBS,
+        }
+    }
+}
+
+/// Create vertices for a wireframe unit cube (0,0,0) to (1,1,1) using thick quads
+/// Each edge is rendered as a thin box/quad for thickness since wgpu doesn't support line width
+fn create_selection_box_mesh() -> (Vec<SelectionVertex>, Vec<u32>) {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+
+    // Line thickness (half-width of the quad)
+    let t = 0.015;
+
+    // Helper to add a thick line segment as a box
+    let mut add_edge = |p1: [f32; 3], p2: [f32; 3]| {
+        let base_idx = vertices.len() as u32;
+
+        // Determine which axis the edge runs along
+        let dx = (p2[0] - p1[0]).abs();
+        let dy = (p2[1] - p1[1]).abs();
+        let dz = (p2[2] - p1[2]).abs();
+
+        if dx > 0.5 {
+            // Edge along X axis - expand in Y and Z
+            vertices.push(SelectionVertex { position: [p1[0], p1[1] - t, p1[2] - t] });
+            vertices.push(SelectionVertex { position: [p2[0], p1[1] - t, p1[2] - t] });
+            vertices.push(SelectionVertex { position: [p2[0], p1[1] + t, p1[2] - t] });
+            vertices.push(SelectionVertex { position: [p1[0], p1[1] + t, p1[2] - t] });
+            vertices.push(SelectionVertex { position: [p1[0], p1[1] - t, p1[2] + t] });
+            vertices.push(SelectionVertex { position: [p2[0], p1[1] - t, p1[2] + t] });
+            vertices.push(SelectionVertex { position: [p2[0], p1[1] + t, p1[2] + t] });
+            vertices.push(SelectionVertex { position: [p1[0], p1[1] + t, p1[2] + t] });
+        } else if dy > 0.5 {
+            // Edge along Y axis - expand in X and Z
+            vertices.push(SelectionVertex { position: [p1[0] - t, p1[1], p1[2] - t] });
+            vertices.push(SelectionVertex { position: [p1[0] + t, p1[1], p1[2] - t] });
+            vertices.push(SelectionVertex { position: [p1[0] + t, p2[1], p1[2] - t] });
+            vertices.push(SelectionVertex { position: [p1[0] - t, p2[1], p1[2] - t] });
+            vertices.push(SelectionVertex { position: [p1[0] - t, p1[1], p1[2] + t] });
+            vertices.push(SelectionVertex { position: [p1[0] + t, p1[1], p1[2] + t] });
+            vertices.push(SelectionVertex { position: [p1[0] + t, p2[1], p1[2] + t] });
+            vertices.push(SelectionVertex { position: [p1[0] - t, p2[1], p1[2] + t] });
+        } else {
+            // Edge along Z axis - expand in X and Y
+            vertices.push(SelectionVertex { position: [p1[0] - t, p1[1] - t, p1[2]] });
+            vertices.push(SelectionVertex { position: [p1[0] + t, p1[1] - t, p1[2]] });
+            vertices.push(SelectionVertex { position: [p1[0] + t, p1[1] - t, p2[2]] });
+            vertices.push(SelectionVertex { position: [p1[0] - t, p1[1] - t, p2[2]] });
+            vertices.push(SelectionVertex { position: [p1[0] - t, p1[1] + t, p1[2]] });
+            vertices.push(SelectionVertex { position: [p1[0] + t, p1[1] + t, p1[2]] });
+            vertices.push(SelectionVertex { position: [p1[0] + t, p1[1] + t, p2[2]] });
+            vertices.push(SelectionVertex { position: [p1[0] - t, p1[1] + t, p2[2]] });
+        }
+
+        // Add indices for all 6 faces of the box
+        // Front face
+        indices.extend_from_slice(&[base_idx, base_idx + 1, base_idx + 2, base_idx, base_idx + 2, base_idx + 3]);
+        // Back face
+        indices.extend_from_slice(&[base_idx + 4, base_idx + 6, base_idx + 5, base_idx + 4, base_idx + 7, base_idx + 6]);
+        // Top face
+        indices.extend_from_slice(&[base_idx + 3, base_idx + 2, base_idx + 6, base_idx + 3, base_idx + 6, base_idx + 7]);
+        // Bottom face
+        indices.extend_from_slice(&[base_idx, base_idx + 5, base_idx + 1, base_idx, base_idx + 4, base_idx + 5]);
+        // Left face
+        indices.extend_from_slice(&[base_idx, base_idx + 3, base_idx + 7, base_idx, base_idx + 7, base_idx + 4]);
+        // Right face
+        indices.extend_from_slice(&[base_idx + 1, base_idx + 6, base_idx + 2, base_idx + 1, base_idx + 5, base_idx + 6]);
+    };
+
+    // 12 edges of the cube
+    // Bottom face edges
+    add_edge([0.0, 0.0, 0.0], [1.0, 0.0, 0.0]); // back
+    add_edge([1.0, 0.0, 0.0], [1.0, 0.0, 1.0]); // right
+    add_edge([1.0, 0.0, 1.0], [0.0, 0.0, 1.0]); // front
+    add_edge([0.0, 0.0, 1.0], [0.0, 0.0, 0.0]); // left
+
+    // Top face edges
+    add_edge([0.0, 1.0, 0.0], [1.0, 1.0, 0.0]); // back
+    add_edge([1.0, 1.0, 0.0], [1.0, 1.0, 1.0]); // right
+    add_edge([1.0, 1.0, 1.0], [0.0, 1.0, 1.0]); // front
+    add_edge([0.0, 1.0, 1.0], [0.0, 1.0, 0.0]); // left
+
+    // Vertical edges
+    add_edge([0.0, 0.0, 0.0], [0.0, 1.0, 0.0]); // back-left
+    add_edge([1.0, 0.0, 0.0], [1.0, 1.0, 0.0]); // back-right
+    add_edge([1.0, 0.0, 1.0], [1.0, 1.0, 1.0]); // front-right
+    add_edge([0.0, 0.0, 1.0], [0.0, 1.0, 1.0]); // front-left
+
+    (vertices, indices)
 }
 
 impl LightUniform {
@@ -126,6 +264,7 @@ pub struct Renderer {
     render_pipeline: wgpu::RenderPipeline,
     shadow_pipeline: wgpu::RenderPipeline,
     sky_pipeline: wgpu::RenderPipeline,
+    selection_pipeline: wgpu::RenderPipeline,
     // Double-buffered vertex/index buffers to avoid GPU contention
     vertex_buffers: [wgpu::Buffer; 2],
     index_buffers: [wgpu::Buffer; 2],
@@ -143,6 +282,14 @@ pub struct Renderer {
     sky_buffer: wgpu::Buffer,
     sky_bind_group: wgpu::BindGroup,
     sky_uniform: SkyUniform,
+    // Selection box rendering
+    selection_vertex_buffer: wgpu::Buffer,
+    selection_index_buffer: wgpu::Buffer,
+    selection_num_indices: u32,
+    selection_buffer: wgpu::Buffer,
+    selection_bind_group: wgpu::BindGroup,
+    selection_uniform: SelectionUniform,
+    selection_active: bool,
     /// Fast texture lookup array indexed by BlockType discriminant
     block_textures: BlockTextureArray,
     /// Current game time (in seconds, wraps at day length)
@@ -151,6 +298,8 @@ pub struct Renderer {
     day_length: f32,
     /// Whether time is frozen
     time_frozen: bool,
+    /// Animation time for selection pulse
+    animation_time: f32,
 }
 
 /// Calculate GPU buffer sizes based on render distance
@@ -627,6 +776,105 @@ impl Renderer {
             cache: None,
         });
 
+        // Selection box shader and pipeline
+        let selection_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Selection Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("selection.wgsl").into()),
+        });
+
+        // Selection uniform buffer
+        let selection_uniform = SelectionUniform::new();
+        let selection_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Selection Buffer"),
+            contents: bytemuck::cast_slice(&[selection_uniform]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let selection_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+                label: Some("selection_bind_group_layout"),
+            });
+
+        let selection_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &selection_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: selection_buffer.as_entire_binding(),
+            }],
+            label: Some("selection_bind_group"),
+        });
+
+        // Create selection box mesh (unit cube)
+        let (selection_vertices, selection_indices) = create_selection_box_mesh();
+        let selection_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Selection Vertex Buffer"),
+            contents: bytemuck::cast_slice(&selection_vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let selection_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Selection Index Buffer"),
+            contents: bytemuck::cast_slice(&selection_indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let selection_num_indices = selection_indices.len() as u32;
+
+        let selection_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Selection Pipeline Layout"),
+                bind_group_layouts: &[&camera_bind_group_layout, &selection_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        let selection_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Selection Pipeline"),
+            layout: Some(&selection_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &selection_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[SelectionVertex::desc()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &selection_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList, // Thick edges as quads
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None, // Render both sides
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false, // Don't write depth for overlay
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         // Calculate buffer sizes based on render distance
         let (vertex_buffer_size, index_buffer_size) = calculate_buffer_sizes(render_distance, height_chunks);
 
@@ -673,6 +921,7 @@ impl Renderer {
             render_pipeline,
             shadow_pipeline,
             sky_pipeline,
+            selection_pipeline,
             vertex_buffers,
             index_buffers,
             num_indices: [0, 0],
@@ -689,10 +938,18 @@ impl Renderer {
             sky_buffer,
             sky_bind_group,
             sky_uniform,
+            selection_vertex_buffer,
+            selection_index_buffer,
+            selection_num_indices,
+            selection_buffer,
+            selection_bind_group,
+            selection_uniform,
+            selection_active: false,
             block_textures,
             game_time: 0.35 * 120.0, // Start at sunrise (0.25 of day cycle)
             day_length: 120.0, // 2 minutes per full day cycle
-            time_frozen: false, // Start with time frozen
+            time_frozen: false, // Start with time unfrozen
+            animation_time: 0.0,
         }
     }
 
@@ -726,6 +983,9 @@ impl Renderer {
 
     /// Update time of day and lighting. Call this each frame with delta time.
     pub fn update_time(&mut self, dt: f32, camera_pos: Vec3) {
+        // Update animation time (always advances for selection pulse)
+        self.animation_time += dt;
+
         // Advance game time (only if not frozen)
         if !self.time_frozen {
             self.game_time += dt;
@@ -746,6 +1006,24 @@ impl Renderer {
             0,
             bytemuck::cast_slice(&[self.light_uniform]),
         );
+    }
+
+    /// Update selection highlight for a raycast hit
+    pub fn update_selection(&mut self, hit: Option<&RaycastHit>) {
+        match hit {
+            Some(hit) => {
+                self.selection_active = true;
+                self.selection_uniform.update(hit, self.animation_time);
+                self.queue.write_buffer(
+                    &self.selection_buffer,
+                    0,
+                    bytemuck::cast_slice(&[self.selection_uniform]),
+                );
+            }
+            None => {
+                self.selection_active = false;
+            }
+        }
     }
 
     /// Toggle time freeze on/off
@@ -942,6 +1220,19 @@ impl Renderer {
                 wgpu::IndexFormat::Uint32,
             );
             render_pass.draw_indexed(0..self.num_indices[self.current_buffer], 0, 0..1);
+
+            // Render selection box overlay if active
+            if self.selection_active {
+                render_pass.set_pipeline(&self.selection_pipeline);
+                render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                render_pass.set_bind_group(1, &self.selection_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, self.selection_vertex_buffer.slice(..));
+                render_pass.set_index_buffer(
+                    self.selection_index_buffer.slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                render_pass.draw_indexed(0..self.selection_num_indices, 0, 0..1);
+            }
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));

@@ -2,6 +2,7 @@ mod camera;
 mod config;
 #[cfg(feature = "embed-assets")]
 mod embedded_assets;
+mod raycast;
 mod renderer;
 mod texture;
 mod voxel;
@@ -12,14 +13,17 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use winit::application::ApplicationHandler;
-use winit::event::{DeviceEvent, DeviceId, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use camera::{Camera, CameraController};
 use config::{CompiledBiomesConfig, Config};
+use raycast::{get_camera_direction, raycast, RaycastHit};
 use renderer::Renderer;
 use texture::TextureManager;
+use voxel::BlockType;
 use worldgen::World;
 
 struct App {
@@ -35,6 +39,9 @@ struct App {
     frame_count: u32,
     fps_timer: Instant,
     current_fps: f32,
+    // Voxel selection and editing
+    current_selection: Option<RaycastHit>,
+    selected_block_type: BlockType,
 }
 
 impl App {
@@ -78,6 +85,8 @@ impl App {
             frame_count: 0,
             fps_timer: Instant::now(),
             current_fps: 0.0,
+            current_selection: None,
+            selected_block_type: BlockType::Stone, // Default block to place
         }
     }
 }
@@ -173,8 +182,53 @@ impl ApplicationHandler for App {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 self.camera_controller.process_keyboard(&event);
+
+                // Block type selection with number keys (only on press, not release)
+                if event.state == ElementState::Pressed {
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::Digit1) => self.selected_block_type = BlockType::Stone,
+                        PhysicalKey::Code(KeyCode::Digit2) => self.selected_block_type = BlockType::Dirt,
+                        PhysicalKey::Code(KeyCode::Digit3) => self.selected_block_type = BlockType::Grass,
+                        PhysicalKey::Code(KeyCode::Digit4) => self.selected_block_type = BlockType::Wood,
+                        PhysicalKey::Code(KeyCode::Digit5) => self.selected_block_type = BlockType::Cobblestone,
+                        PhysicalKey::Code(KeyCode::Digit6) => self.selected_block_type = BlockType::Sand,
+                        PhysicalKey::Code(KeyCode::Digit7) => self.selected_block_type = BlockType::Brick,
+                        PhysicalKey::Code(KeyCode::Digit8) => self.selected_block_type = BlockType::Leaves,
+                        PhysicalKey::Code(KeyCode::Digit9) => self.selected_block_type = BlockType::Snow,
+                        _ => {}
+                    }
+                }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                // Only handle left click for block operations (right click is for camera)
+                if state == ElementState::Pressed {
+                    match button {
+                        MouseButton::Left => {
+                            // Destroy block at selection
+                            if let Some(hit) = &self.current_selection {
+                                if let Some(world) = &mut self.world {
+                                    let pos = hit.block_pos;
+                                    if world.destroy_block(pos[0], pos[1], pos[2]).is_some() {
+                                        log::debug!("Destroyed block at {:?}", pos);
+                                    }
+                                }
+                            }
+                        }
+                        MouseButton::Middle => {
+                            // Place block adjacent to selection
+                            if let Some(hit) = &self.current_selection {
+                                if let Some(world) = &mut self.world {
+                                    let pos = hit.placement_pos();
+                                    if world.place_block(pos[0], pos[1], pos[2], self.selected_block_type) {
+                                        log::debug!("Placed {:?} at {:?}", self.selected_block_type, pos);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                // Still pass to camera controller for right-click camera movement
                 self.camera_controller.process_mouse_button(button, state);
             }
             WindowEvent::RedrawRequested => {
@@ -210,7 +264,16 @@ impl ApplicationHandler for App {
 
                     // Update world chunks based on player position
                     if let Some(world) = &mut self.world {
-                        let chunks_changed = world.update_for_position(camera.position.x, camera.position.z);
+                        let _chunks_changed = world.update_for_position(camera.position.x, camera.position.z);
+
+                        // Perform raycast for block selection
+                        let direction = get_camera_direction(camera.yaw, camera.pitch);
+                        self.current_selection = raycast(world, camera.position, direction, 10.0);
+
+                        // Update renderer with selection
+                        if let Some(renderer) = &mut self.renderer {
+                            renderer.update_selection(self.current_selection.as_ref());
+                        }
 
                         // Rebuild mesh if chunks changed (always use current frustum for culling)
                         // Also update every frame for frustum culling when camera rotates

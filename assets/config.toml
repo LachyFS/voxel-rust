@@ -30,9 +30,9 @@ cave_worm_threshold = 0.025
 
 # Cheese caves - larger open caverns (set threshold to 1.0 to disable)
 # Scale (smaller = larger caverns)
-cave_cheese_scale = 0.04
+cave_cheese_scale = 0.05
 # Threshold (higher = fewer/smaller caves, 0.65-0.85)
-cave_cheese_threshold = 0.78
+cave_cheese_threshold = 0.1
 
 # Secondary tunnel layer (set threshold to 1.0 to disable)
 cave_scale = 0.05
