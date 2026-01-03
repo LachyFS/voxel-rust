@@ -520,7 +520,8 @@ impl WorldGenerator {
             return BlockType::Air;
         }
 
-        if self.is_cave(x, y, z) && y < surface_height - 1 {
+        // Carve caves - can now reach the surface for cave entrances
+        if self.is_cave(x, y, z) {
             return BlockType::Air;
         }
 
@@ -568,62 +569,73 @@ impl WorldGenerator {
             return true;
         }
 
-        // Caves only below a certain height
-        let max_cave_height = self.config.sea_level + 40;
-        if y > max_cave_height {
+        // Get surface height for this column
+        let surface_height = self.get_terrain_height(x, z);
+
+        // Don't generate caves above the surface
+        if y > surface_height {
             return false;
         }
 
-        // Calculate depth factor for cave density (more caves deeper underground)
-        let depth_below_surface = (max_cave_height - y) as f64;
-        let depth_factor = (depth_below_surface / 50.0).clamp(0.0, 1.0);
+        let depth_below_terrain = surface_height - y;
+
+        // === Surface Protection with Entrance Regions ===
+        // Use 2D noise to define regions where caves CAN reach the surface
+        let entrance_noise = self.biome_blend_noise.get([
+            x as f64 * 0.006,
+            z as f64 * 0.006,
+        ]);
+
+        // ~40% allows surface entrances, ~30% shallow protection, ~30% deep protection
+        let min_depth = if entrance_noise > 0.2 {
+            0  // Cave entrance region - caves can reach surface
+        } else if entrance_noise > -0.3 {
+            2  // Transition - caves stop just below surface
+        } else {
+            4  // Protected region - caves stay underground
+        };
+
+        if depth_below_terrain < min_depth {
+            return false;
+        }
 
         // === Spaghetti/Worm Caves ===
         // Creates connected tunnel networks by finding where two 3D noise "surfaces" intersect
         let worm_scale = self.config.cave_worm_scale;
 
-        // Sample two independent 3D noise fields
         let worm_a = self.cave_worm_noise_x.get([
             x as f64 * worm_scale,
-            y as f64 * worm_scale * 0.4, // Stretch vertically for more horizontal tunnels
+            y as f64 * worm_scale * 0.5,
             z as f64 * worm_scale,
         ]);
         let worm_b = self.cave_worm_noise_y.get([
-            x as f64 * worm_scale * 0.8 + 1000.0,
-            y as f64 * worm_scale * 0.4,
-            z as f64 * worm_scale * 0.8 + 1000.0,
+            x as f64 * worm_scale + 1000.0,
+            y as f64 * worm_scale * 0.5,
+            z as f64 * worm_scale + 1000.0,
         ]);
 
         // Cave exists where both noise values are close to zero
-        // Threshold increases with depth (more caves deeper)
-        let base_worm_threshold = self.config.cave_worm_threshold;
-        let worm_threshold = base_worm_threshold * (0.6 + 0.4 * depth_factor);
-
-        // Use squared distance from zero for smoother tunnel shapes
         let worm_dist = (worm_a * worm_a + worm_b * worm_b).sqrt();
-        if worm_dist < worm_threshold {
+        if worm_dist < self.config.cave_worm_threshold {
             return true;
         }
 
         // === Cheese Caves (Large Caverns) ===
-        // Only generate if threshold is reasonable (user can disable with threshold >= 1.0)
-        if self.config.cave_cheese_threshold < 1.0 {
+        // These need more depth to avoid huge surface holes
+        if self.config.cave_cheese_threshold < 1.0 && depth_below_terrain >= 8 {
             let cheese_scale = self.config.cave_cheese_scale;
             let cheese_noise = self.cave_cheese_noise.get([
                 x as f64 * cheese_scale,
-                y as f64 * cheese_scale * 0.5, // Flattened vertically for wider caverns
+                y as f64 * cheese_scale * 0.5,
                 z as f64 * cheese_scale,
             ]);
 
-            // Cheese caves more common at lower depths
-            let cheese_threshold = self.config.cave_cheese_threshold - depth_factor * 0.1;
-            if cheese_noise > cheese_threshold {
+            if cheese_noise > self.config.cave_cheese_threshold {
                 return true;
             }
         }
 
-        // === Additional tunnel layer for variety ===
-        // Uses the legacy noise but with better parameters
+        // === Additional tunnel layer ===
         if self.config.cave_threshold < 1.0 {
             let scale = self.config.cave_scale;
             let noise1 = self.cave_noise.get([
@@ -637,9 +649,8 @@ impl WorldGenerator {
                 z as f64 * scale * 1.5 + 500.0,
             ]);
 
-            // Intersection of two noise surfaces creates tunnels
             let tunnel_dist = (noise1 * noise1 + noise2 * noise2).sqrt();
-            let tunnel_threshold = (1.0 - self.config.cave_threshold) * 0.15 * (0.5 + 0.5 * depth_factor);
+            let tunnel_threshold = (1.0 - self.config.cave_threshold) * 0.12;
             if tunnel_dist < tunnel_threshold {
                 return true;
             }
@@ -908,7 +919,8 @@ impl WorldGenerator {
             return BlockType::Air;
         }
 
-        if self.is_cave(x, y, z) && y < surface_height - 1 {
+        // Carve caves - can now reach the surface for cave entrances
+        if self.is_cave(x, y, z) {
             return BlockType::Air;
         }
 
@@ -1357,5 +1369,118 @@ impl World {
     ) -> (&[Vertex], &[u32]) {
         self.update_dirty_meshes(texture_indices);
         self.collect_world_mesh(frustum)
+    }
+
+    /// Set a block at world coordinates and mark affected chunks for remeshing
+    /// Returns true if the block was successfully set
+    pub fn set_block(&mut self, world_x: i32, world_y: i32, world_z: i32, block: BlockType) -> bool {
+        let chunk_size = CHUNK_SIZE as i32;
+
+        // Convert world position to chunk position
+        let chunk_pos = (
+            world_x.div_euclid(chunk_size),
+            world_y.div_euclid(chunk_size),
+            world_z.div_euclid(chunk_size),
+        );
+
+        // Get the chunk (must exist)
+        let Some(chunk) = self.chunks.get_mut(&chunk_pos) else {
+            return false;
+        };
+
+        // Convert to local coordinates within the chunk
+        let local_x = world_x.rem_euclid(chunk_size) as usize;
+        let local_y = world_y.rem_euclid(chunk_size) as usize;
+        let local_z = world_z.rem_euclid(chunk_size) as usize;
+
+        // Set the block
+        chunk.set_block(local_x, local_y, local_z, block);
+        chunk.mark_dirty();
+
+        // Mark neighbor chunks for remesh if block is at chunk boundary
+        if local_x == 0 {
+            if let Some(neighbor) = self.chunks.get_mut(&(chunk_pos.0 - 1, chunk_pos.1, chunk_pos.2)) {
+                neighbor.mark_dirty();
+            }
+        }
+        if local_x == CHUNK_SIZE - 1 {
+            if let Some(neighbor) = self.chunks.get_mut(&(chunk_pos.0 + 1, chunk_pos.1, chunk_pos.2)) {
+                neighbor.mark_dirty();
+            }
+        }
+        if local_y == 0 {
+            if let Some(neighbor) = self.chunks.get_mut(&(chunk_pos.0, chunk_pos.1 - 1, chunk_pos.2)) {
+                neighbor.mark_dirty();
+            }
+        }
+        if local_y == CHUNK_SIZE - 1 {
+            if let Some(neighbor) = self.chunks.get_mut(&(chunk_pos.0, chunk_pos.1 + 1, chunk_pos.2)) {
+                neighbor.mark_dirty();
+            }
+        }
+        if local_z == 0 {
+            if let Some(neighbor) = self.chunks.get_mut(&(chunk_pos.0, chunk_pos.1, chunk_pos.2 - 1)) {
+                neighbor.mark_dirty();
+            }
+        }
+        if local_z == CHUNK_SIZE - 1 {
+            if let Some(neighbor) = self.chunks.get_mut(&(chunk_pos.0, chunk_pos.1, chunk_pos.2 + 1)) {
+                neighbor.mark_dirty();
+            }
+        }
+
+        true
+    }
+
+    /// Get a block at world coordinates
+    /// Returns None if the chunk doesn't exist
+    pub fn get_block(&self, world_x: i32, world_y: i32, world_z: i32) -> Option<BlockType> {
+        let chunk_size = CHUNK_SIZE as i32;
+
+        // Convert world position to chunk position
+        let chunk_pos = (
+            world_x.div_euclid(chunk_size),
+            world_y.div_euclid(chunk_size),
+            world_z.div_euclid(chunk_size),
+        );
+
+        // Get the chunk
+        let chunk = self.chunks.get(&chunk_pos)?;
+
+        // Convert to local coordinates within the chunk
+        let local_x = world_x.rem_euclid(chunk_size) as usize;
+        let local_y = world_y.rem_euclid(chunk_size) as usize;
+        let local_z = world_z.rem_euclid(chunk_size) as usize;
+
+        Some(chunk.get_block(local_x, local_y, local_z))
+    }
+
+    /// Destroy a block at world coordinates (set to Air)
+    /// Returns the block type that was destroyed, or None if failed
+    pub fn destroy_block(&mut self, world_x: i32, world_y: i32, world_z: i32) -> Option<BlockType> {
+        let old_block = self.get_block(world_x, world_y, world_z)?;
+        if old_block == BlockType::Air {
+            return None;
+        }
+        if self.set_block(world_x, world_y, world_z, BlockType::Air) {
+            Some(old_block)
+        } else {
+            None
+        }
+    }
+
+    /// Place a block at world coordinates
+    /// Returns true if successfully placed
+    pub fn place_block(&mut self, world_x: i32, world_y: i32, world_z: i32, block: BlockType) -> bool {
+        // Check if the position is valid (chunk exists and position is air)
+        if let Some(existing) = self.get_block(world_x, world_y, world_z) {
+            if existing != BlockType::Air {
+                return false; // Can't place in non-air block
+            }
+        } else {
+            return false; // Chunk doesn't exist
+        }
+
+        self.set_block(world_x, world_y, world_z, block)
     }
 }
