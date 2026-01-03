@@ -513,7 +513,11 @@ impl WorldGenerator {
     /// Get block at position (legacy method without structure support)
     #[allow(dead_code)]
     fn get_block_at(&self, x: i32, y: i32, z: i32, surface_height: i32, biome: &CompiledBiome) -> BlockType {
-        if y > surface_height {
+        // Use 3D noise for terrain density - enables overhangs and cliffs
+        let is_solid = self.is_terrain_solid(x, y, z, surface_height, biome);
+
+        if !is_solid {
+            // Carve caves in air space too (for cave ceilings)
             if y <= self.config.sea_level {
                 return BlockType::Water;
             }
@@ -525,8 +529,12 @@ impl WorldGenerator {
             return BlockType::Air;
         }
 
+        // Determine if this is a surface block by checking if block above is air
+        let above_solid = self.is_terrain_solid(x, y + 1, z, surface_height, biome);
+        let is_surface = !above_solid || y == surface_height;
+
         // Surface block
-        if y == surface_height {
+        if is_surface {
             // Check if we're above the stone altitude threshold
             if let Some(stone_alt) = biome.stone_altitude {
                 if y > self.config.sea_level + stone_alt {
@@ -536,8 +544,22 @@ impl WorldGenerator {
             return biome.surface_block;
         }
 
-        // Subsurface (up to 4 blocks deep)
-        if y > surface_height - 4 {
+        // Subsurface (check a few blocks to see if near surface)
+        let depth_to_surface = if y < surface_height {
+            // Check upward for air
+            let mut depth = 0;
+            for dy in 1..=4 {
+                if !self.is_terrain_solid(x, y + dy, z, surface_height, biome) {
+                    depth = dy;
+                    break;
+                }
+            }
+            depth
+        } else {
+            0
+        };
+
+        if depth_to_surface > 0 && depth_to_surface <= 4 {
             return biome.subsurface_block;
         }
 
@@ -555,6 +577,61 @@ impl WorldGenerator {
         }
 
         BlockType::Stone
+    }
+
+    /// Determines if a block position should be solid terrain using 3D noise
+    /// This creates overhangs, cliffs, and more complex terrain shapes
+    fn is_terrain_solid(&self, x: i32, y: i32, z: i32, surface_height: i32, biome: &CompiledBiome) -> bool {
+        // Basic height check - well below surface is always solid, well above is always air
+        let height_diff = y - surface_height;
+
+        if height_diff > 15 {
+            return false; // Well above surface - always air
+        }
+        if height_diff < -30 {
+            return true; // Well below surface - always solid
+        }
+
+        // 3D noise for terrain density
+        let density_scale = 0.025;
+        let density_noise = self.cave_cheese_noise.get([
+            x as f64 * density_scale,
+            y as f64 * density_scale * 0.6, // Stretch vertically
+            z as f64 * density_scale,
+        ]);
+
+        // Cliff noise - creates vertical features
+        let cliff_scale = 0.015;
+        let cliff_noise = self.biome_blend_noise.get([
+            x as f64 * cliff_scale,
+            z as f64 * cliff_scale,
+        ]);
+        let has_cliff = cliff_noise > 0.5;
+
+        // Height gradient - higher = less likely to be solid
+        // This creates the basic terrain shape
+        let height_factor = height_diff as f64 / 20.0; // -1.5 at -30, 0 at surface, 0.75 at +15
+
+        // Base density threshold - adjusted by height
+        // Below surface: low threshold (more solid)
+        // Above surface: high threshold (less solid)
+        let base_threshold = height_factor * 0.8;
+
+        // In cliff regions, allow more vertical variation
+        let threshold = if has_cliff && height_diff.abs() < 20 {
+            // Cliffs have sharper transitions
+            let cliff_detail = self.detail_noise.get([
+                x as f64 * 0.05,
+                y as f64 * 0.08,
+                z as f64 * 0.05,
+            ]);
+            base_threshold + cliff_detail * 0.3
+        } else {
+            base_threshold
+        };
+
+        // Solid if noise exceeds threshold
+        density_noise > threshold
     }
 
     /// Check if a position should be carved out as a cave or ravine
@@ -578,6 +655,12 @@ impl WorldGenerator {
         }
 
         let depth_below_terrain = surface_height - y;
+
+        // === Large Cave Entrances (Minecraft-style) ===
+        // These create big openings in hillsides that lead into cave systems
+        if self.is_cave_entrance(x, y, z, surface_height) {
+            return true;
+        }
 
         // === Surface Protection with Entrance Regions ===
         // Use 2D noise to define regions where caves CAN reach the surface
@@ -718,6 +801,103 @@ impl WorldGenerator {
         ravine_value > width_threshold
     }
 
+    /// Find the actual surface Y position at a given XZ, accounting for 3D terrain and caves
+    /// Returns None if the surface is unsuitable for structure placement (e.g., over a cave)
+    fn find_actual_surface_for_structure(&self, x: i32, z: i32) -> Option<i32> {
+        let base_height = self.get_terrain_height(x, z);
+        let biome = self.get_biome(x, z);
+
+        // Start scanning from above the expected surface
+        let scan_start = base_height + 10;
+        let scan_end = base_height - 20;
+
+        // Find the first solid block from above (that's the actual surface)
+        for y in (scan_end..=scan_start).rev() {
+            if self.is_terrain_solid(x, y, z, base_height, biome) {
+                // Make sure there's air above (not inside an overhang)
+                if !self.is_terrain_solid(x, y + 1, z, base_height, biome) {
+                    // Check if this block would be carved by a cave
+                    if self.is_cave(x, y, z) {
+                        continue; // Keep looking lower
+                    }
+
+                    // Check that there's solid ground below (not placing over a cave)
+                    // We need at least 2 blocks of solid ground
+                    let mut solid_below = true;
+                    for dy in 1..=2 {
+                        let check_y = y - dy;
+                        if self.is_cave(x, check_y, z) || !self.is_terrain_solid(x, check_y, z, base_height, biome) {
+                            solid_below = false;
+                            break;
+                        }
+                    }
+
+                    if solid_below {
+                        return Some(y);
+                    }
+                }
+            }
+        }
+
+        // No valid surface found - don't place structure here
+        None
+    }
+
+    /// Check if a position should be carved as a large cave entrance
+    /// These are big, dramatic openings in hillsides like Minecraft has
+    fn is_cave_entrance(&self, x: i32, y: i32, z: i32, surface_height: i32) -> bool {
+        // Cave entrances only form in terrain with some height variation
+        // They need to be on a slope/hillside
+        let depth_below_surface = surface_height - y;
+
+        // Only carve entrances within 20 blocks of surface
+        if depth_below_surface > 20 || depth_below_surface < 0 {
+            return false;
+        }
+
+        // Use 2D noise to place cave entrance locations (rare, large features)
+        let entrance_scale = 0.008;
+        let entrance_noise = self.cave_worm_noise_x.get([
+            x as f64 * entrance_scale,
+            z as f64 * entrance_scale,
+        ]);
+
+        // Only ~10% of locations can have entrances
+        if entrance_noise < 0.75 {
+            return false;
+        }
+
+        // Check if we're on a slope by sampling nearby terrain heights
+        let height_nx = self.get_terrain_height(x - 4, z);
+        let height_px = self.get_terrain_height(x + 4, z);
+        let height_nz = self.get_terrain_height(x, z - 4);
+        let height_pz = self.get_terrain_height(x, z + 4);
+
+        let slope_x = (height_px - height_nx).abs();
+        let slope_z = (height_pz - height_nz).abs();
+        let max_slope = slope_x.max(slope_z);
+
+        // Need some slope for a hillside entrance (at least 3 blocks over 8)
+        if max_slope < 3 {
+            return false;
+        }
+
+        // Use 3D noise for the entrance shape - creates arch-like openings
+        let shape_scale = 0.06;
+        let shape_noise = self.cave_cheese_noise.get([
+            x as f64 * shape_scale,
+            y as f64 * shape_scale * 0.7,  // Stretch vertically for taller entrances
+            z as f64 * shape_scale,
+        ]);
+
+        // Entrance carves where noise is high, with vertical falloff
+        // More likely to carve near bottom of entrance zone
+        let vertical_factor = 1.0 - (depth_below_surface as f64 / 20.0);
+        let carve_threshold = 0.3 + vertical_factor * 0.4; // 0.3 at bottom, 0.7 at surface
+
+        shape_noise > carve_threshold
+    }
+
     fn get_ore(&self, x: i32, y: i32, z: i32) -> Option<BlockType> {
         if y < 80 && y > 5 {
             let coal =
@@ -856,9 +1036,11 @@ impl WorldGenerator {
 
         for sx in min_x..max_x {
             for sz in min_z..max_z {
-                // Get biome and height for this potential spawn point
+                // Get biome and find valid surface (accounting for 3D terrain and caves)
                 let biome = self.get_biome(sx, sz);
-                let surface_height = self.get_terrain_height(sx, sz);
+                let Some(surface_height) = self.find_actual_surface_for_structure(sx, sz) else {
+                    continue; // No valid surface - skip this position
+                };
 
                 // Check if a structure spawns here
                 if let Some(structure_type) = self.get_structure_at(sx, sz, biome, surface_height) {
@@ -906,8 +1088,11 @@ impl WorldGenerator {
         biome: &CompiledBiome,
         structure_blocks: &HashMap<(i32, i32, i32), BlockType>,
     ) -> BlockType {
+        // Use 3D noise for terrain density - enables overhangs and cliffs
+        let is_solid = self.is_terrain_solid(x, y, z, surface_height, biome);
+
         // Check for structures first (they can be above ground)
-        if y > surface_height {
+        if !is_solid {
             // O(1) lookup instead of O(n²) search
             if let Some(&block) = structure_blocks.get(&(x, y, z)) {
                 return block;
@@ -924,8 +1109,12 @@ impl WorldGenerator {
             return BlockType::Air;
         }
 
+        // Determine if this is a surface block by checking if block above is air
+        let above_solid = self.is_terrain_solid(x, y + 1, z, surface_height, biome);
+        let is_surface = !above_solid;
+
         // Surface block
-        if y == surface_height {
+        if is_surface {
             // Check if we're above the stone altitude threshold
             if let Some(stone_alt) = biome.stone_altitude {
                 if y > self.config.sea_level + stone_alt {
@@ -935,8 +1124,15 @@ impl WorldGenerator {
             return biome.surface_block;
         }
 
-        // Subsurface (up to 4 blocks deep)
-        if y > surface_height - 4 {
+        // Subsurface - check if near any air pocket above
+        let mut near_surface = false;
+        for dy in 1..=4 {
+            if !self.is_terrain_solid(x, y + dy, z, surface_height, biome) {
+                near_surface = true;
+                break;
+            }
+        }
+        if near_surface {
             return biome.subsurface_block;
         }
 
