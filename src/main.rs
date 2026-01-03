@@ -244,12 +244,22 @@ impl ApplicationHandler for App {
                     self.frame_count = 0;
                     self.fps_timer = Instant::now();
 
-                    // Update window title with FPS and time of day
+                    // Update window title with FPS, time of day, and biome
                     if let Some(window) = &self.window {
                         let time_str = self.renderer.as_ref()
                             .map(|r| r.get_time_string())
                             .unwrap_or_default();
-                        window.set_title(&format!("Voxel World - {:.0} FPS - {}", self.current_fps, time_str));
+                        let biome_str = match (&self.camera, &self.world) {
+                            (Some(camera), Some(world)) => {
+                                world.get_biome_name(camera.position.x, camera.position.z).to_string()
+                            }
+                            _ => String::new(),
+                        };
+                        if biome_str.is_empty() {
+                            window.set_title(&format!("Voxel World - {:.0} FPS - {}", self.current_fps, time_str));
+                        } else {
+                            window.set_title(&format!("Voxel World - {:.0} FPS - {} - {}", self.current_fps, time_str, biome_str));
+                        }
                     }
                 }
 

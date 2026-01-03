@@ -17,7 +17,7 @@
 
 [settings]
 # Scale for biome noise (smaller = larger biomes)
-biome_scale = 0.005
+biome_scale = 0.001
 # Blend radius for smooth biome transitions (0.0 = hard edges, higher = smoother)
 blend_radius = 0.15
 # Noise strength for irregular biome boundaries (0.0 = smooth edges, higher = more jagged)
@@ -165,3 +165,17 @@ base_height = 0
 noise_scale = 0.6
 detail_strength = 0.15
 flatness = 0.5
+
+# Ocean - deep underwater terrain with sandy/gravel floor
+[biomes.ocean]
+temperature_min = -0.3
+temperature_max = 0.3
+moisture_min = 0.7
+moisture_max = 1.0
+surface_block = "sand"
+subsurface_block = "gravel"
+height_scale = 0.3
+base_height = -25
+noise_scale = 0.5
+detail_strength = 0.1
+flatness = 0.6

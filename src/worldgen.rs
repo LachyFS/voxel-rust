@@ -258,6 +258,8 @@ pub struct WorldGenerator {
     ravine_depth_noise: Perlin,   // Noise for ravine depth variation
     // Biome blend noise for irregular transitions
     biome_blend_noise: Simplex,   // Adds irregularity to biome boundaries
+    // Pond and lake noise
+    pond_noise: Perlin,           // 2D noise for pond/lake placement
 }
 
 impl WorldGenerator {
@@ -286,6 +288,8 @@ impl WorldGenerator {
             ravine_depth_noise: Perlin::new(seed.wrapping_add(21)),
             // Biome blend noise
             biome_blend_noise: Simplex::new(seed.wrapping_add(30)),
+            // Pond and lake noise
+            pond_noise: Perlin::new(seed.wrapping_add(40)),
             config,
             biomes_config,
         }
@@ -314,11 +318,14 @@ impl WorldGenerator {
 
                 let height = self.get_terrain_height(wx, wz);
                 let biome = self.get_biome(wx, wz);
+                // Get blended flatness for smooth biome transitions
+                let params = self.get_blended_terrain_params(wx, wz);
+                let flatness = params.flatness;
 
                 for local_y in 0..CHUNK_SIZE {
                     let wy = world_y + local_y as i32;
                     let block = self.get_block_at_with_structures(
-                        wx, wy, wz, height, &biome, &structure_blocks
+                        wx, wy, wz, height, flatness, &biome, &structure_blocks
                     );
                     chunk.set_block(local_x, local_y, local_z, block);
                 }
@@ -344,8 +351,10 @@ impl WorldGenerator {
         let flattened_base = base * (1.0 - params.flatness);
 
         // Get detail noise with biome-specific strength
+        // Also reduce detail noise based on flatness - flat terrain shouldn't have detail bumps
         let detail = self.detail_noise.get([x as f64 * scale * 4.0, z as f64 * scale * 4.0])
-            * params.detail_strength;
+            * params.detail_strength
+            * (1.0 - params.flatness * 0.8);
 
         // Combine and normalize to 0-1 range
         let combined = flattened_base + detail;
@@ -368,8 +377,10 @@ impl WorldGenerator {
         let flattened_base = base * (1.0 - biome.flatness);
 
         // Get detail noise with biome-specific strength
+        // Also reduce detail noise based on flatness - flat terrain shouldn't have detail bumps
         let detail = self.detail_noise.get([x as f64 * scale * 4.0, z as f64 * scale * 4.0])
-            * biome.detail_strength;
+            * biome.detail_strength
+            * (1.0 - biome.flatness * 0.8);
 
         // Combine and normalize to 0-1 range
         let combined = flattened_base + detail;
@@ -381,7 +392,8 @@ impl WorldGenerator {
         self.config.sea_level + biome.base_height + height_variation
     }
 
-    fn get_biome(&self, x: i32, z: i32) -> &CompiledBiome {
+    /// Get the biome at a world position
+    pub fn get_biome(&self, x: i32, z: i32) -> &CompiledBiome {
         let scale = self.biomes_config.biome_scale;
         let temperature = self.biome_noise.get([x as f64 * scale, z as f64 * scale]);
         let moisture = self
@@ -513,8 +525,12 @@ impl WorldGenerator {
     /// Get block at position (legacy method without structure support)
     #[allow(dead_code)]
     fn get_block_at(&self, x: i32, y: i32, z: i32, surface_height: i32, biome: &CompiledBiome) -> BlockType {
+        // Get blended flatness for smooth biome transitions
+        let params = self.get_blended_terrain_params(x, z);
+        let flatness = params.flatness;
+
         // Use 3D noise for terrain density - enables overhangs and cliffs
-        let is_solid = self.is_terrain_solid(x, y, z, surface_height, biome);
+        let is_solid = self.is_terrain_solid(x, y, z, surface_height, flatness);
 
         if !is_solid {
             // Carve caves in air space too (for cave ceilings)
@@ -530,7 +546,7 @@ impl WorldGenerator {
         }
 
         // Determine if this is a surface block by checking if block above is air
-        let above_solid = self.is_terrain_solid(x, y + 1, z, surface_height, biome);
+        let above_solid = self.is_terrain_solid(x, y + 1, z, surface_height, flatness);
         let is_surface = !above_solid || y == surface_height;
 
         // Surface block
@@ -549,7 +565,7 @@ impl WorldGenerator {
             // Check upward for air
             let mut depth = 0;
             for dy in 1..=4 {
-                if !self.is_terrain_solid(x, y + dy, z, surface_height, biome) {
+                if !self.is_terrain_solid(x, y + dy, z, surface_height, flatness) {
                     depth = dy;
                     break;
                 }
@@ -579,59 +595,105 @@ impl WorldGenerator {
         BlockType::Stone
     }
 
-    /// Determines if a block position should be solid terrain using 3D noise
-    /// This creates overhangs, cliffs, and more complex terrain shapes
-    fn is_terrain_solid(&self, x: i32, y: i32, z: i32, surface_height: i32, biome: &CompiledBiome) -> bool {
-        // Basic height check - well below surface is always solid, well above is always air
+    /// Determines if a block position should be solid terrain
+    /// Starts with height-based terrain, then adds 3D noise for overhangs/cliffs
+    fn is_terrain_solid(&self, x: i32, y: i32, z: i32, surface_height: i32, _flatness: f64) -> bool {
         let height_diff = y - surface_height;
 
-        if height_diff > 15 {
-            return false; // Well above surface - always air
+        // Well above surface - always air
+        if height_diff > 10 {
+            return false;
         }
-        if height_diff < -30 {
-            return true; // Well below surface - always solid
+        // Well below surface - always solid
+        if height_diff < -20 {
+            return true;
         }
 
-        // 3D noise for terrain density
-        let density_scale = 0.025;
-        let density_noise = self.cave_cheese_noise.get([
+        // Add 3D noise for local variation (overhangs, cliffs)
+        // This only affects blocks near the surface (within ~10 blocks)
+        let density_scale = 0.035;
+        let noise = self.cave_cheese_noise.get([
             x as f64 * density_scale,
-            y as f64 * density_scale * 0.6, // Stretch vertically
+            y as f64 * density_scale * 0.5,
             z as f64 * density_scale,
         ]);
 
-        // Cliff noise - creates vertical features
-        let cliff_scale = 0.015;
-        let cliff_noise = self.biome_blend_noise.get([
-            x as f64 * cliff_scale,
-            z as f64 * cliff_scale,
-        ]);
-        let has_cliff = cliff_noise > 0.5;
+        // The noise can push the surface up or down by a few blocks
+        // noise range is roughly -1 to 1, we map to -3 to +3 blocks offset
+        let noise_offset = (noise * 3.0) as i32;
 
-        // Height gradient - higher = less likely to be solid
-        // This creates the basic terrain shape
-        let height_factor = height_diff as f64 / 20.0; // -1.5 at -30, 0 at surface, 0.75 at +15
+        y <= surface_height + noise_offset
+    }
 
-        // Base density threshold - adjusted by height
-        // Below surface: low threshold (more solid)
-        // Above surface: high threshold (less solid)
-        let base_threshold = height_factor * 0.8;
+    /// Check if a position is within a pond
+    /// Returns Some((water_level, carve_depth)) if in a pond
+    fn get_pond_at(&self, x: i32, z: i32, biome: &CompiledBiome) -> Option<(i32, i32)> {
+        // No ponds in desert or ice biomes
+        match biome.name.as_str() {
+            "desert" | "ice_plains" | "ocean" | "beach" | "mountains" => return None,
+            _ => {}
+        }
 
-        // In cliff regions, allow more vertical variation
-        let threshold = if has_cliff && height_diff.abs() < 20 {
-            // Cliffs have sharper transitions
-            let cliff_detail = self.detail_noise.get([
-                x as f64 * 0.05,
-                y as f64 * 0.08,
-                z as f64 * 0.05,
-            ]);
-            base_threshold + cliff_detail * 0.3
-        } else {
-            base_threshold
-        };
+        // Grid-based pond placement - check nearby grid cells for pond centers
+        let grid_size = 64;
+        let cell_x = x.div_euclid(grid_size);
+        let cell_z = z.div_euclid(grid_size);
 
-        // Solid if noise exceeds threshold
-        density_noise > threshold
+        // Check this cell and neighbors
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                let cx = cell_x + dx;
+                let cz = cell_z + dz;
+
+                // Deterministic check if this cell has a pond
+                let cell_noise = self.pond_noise.get([cx as f64 * 0.7, cz as f64 * 0.7]);
+                if cell_noise < 0.3 {
+                    continue; // No pond in this cell
+                }
+
+                // Pond center position within the cell (offset from cell corner)
+                let offset_noise_x = self.pond_noise.get([cx as f64 * 1.3 + 100.0, cz as f64 * 1.3]);
+                let offset_noise_z = self.pond_noise.get([cx as f64 * 1.3, cz as f64 * 1.3 + 100.0]);
+                let pond_x = cx * grid_size + (grid_size / 4) + ((offset_noise_x + 1.0) * (grid_size as f64 / 4.0)) as i32;
+                let pond_z = cz * grid_size + (grid_size / 4) + ((offset_noise_z + 1.0) * (grid_size as f64 / 4.0)) as i32;
+
+                // Pond size (radius 4-10 blocks)
+                let size_noise = self.pond_noise.get([cx as f64 * 2.1 + 200.0, cz as f64 * 2.1]);
+                let radius = 4.0 + (size_noise + 1.0) * 3.0; // 4-10 blocks
+                let radius_sq = radius * radius;
+
+                // Check if we're within this pond's radius
+                let dist_x = (x - pond_x) as f64;
+                let dist_z = (z - pond_z) as f64;
+                let dist_sq = dist_x * dist_x + dist_z * dist_z;
+
+                if dist_sq > radius_sq {
+                    continue; // Outside this pond
+                }
+
+                // Get terrain height at pond center for water level
+                let center_height = self.get_terrain_height(pond_x, pond_z);
+
+                // Check biome at pond center
+                let center_biome = self.get_biome(pond_x, pond_z);
+                match center_biome.name.as_str() {
+                    "desert" | "ice_plains" | "ocean" | "beach" | "mountains" => continue,
+                    _ => {}
+                }
+
+                // Water level is 1 below center terrain height
+                let water_level = center_height - 1;
+
+                // Depth based on distance from center (deeper in middle)
+                let dist_factor = 1.0 - (dist_sq / radius_sq).sqrt();
+                let max_depth = 2 + ((size_noise + 1.0) * 1.5) as i32; // 2-5 blocks deep
+                let carve_depth = 1 + (dist_factor * max_depth as f64) as i32;
+
+                return Some((water_level, carve_depth));
+            }
+        }
+
+        None
     }
 
     /// Check if a position should be carved out as a cave or ravine
@@ -807,15 +869,24 @@ impl WorldGenerator {
         let base_height = self.get_terrain_height(x, z);
         let biome = self.get_biome(x, z);
 
+        // Don't place structures in ponds/lakes
+        if self.get_pond_at(x, z, biome).is_some() {
+            return None;
+        }
+
+        // Get blended flatness for smooth biome transitions
+        let params = self.get_blended_terrain_params(x, z);
+        let flatness = params.flatness;
+
         // Start scanning from above the expected surface
         let scan_start = base_height + 10;
         let scan_end = base_height - 20;
 
         // Find the first solid block from above (that's the actual surface)
         for y in (scan_end..=scan_start).rev() {
-            if self.is_terrain_solid(x, y, z, base_height, biome) {
+            if self.is_terrain_solid(x, y, z, base_height, flatness) {
                 // Make sure there's air above (not inside an overhang)
-                if !self.is_terrain_solid(x, y + 1, z, base_height, biome) {
+                if !self.is_terrain_solid(x, y + 1, z, base_height, flatness) {
                     // Check if this block would be carved by a cave
                     if self.is_cave(x, y, z) {
                         continue; // Keep looking lower
@@ -826,7 +897,7 @@ impl WorldGenerator {
                     let mut solid_below = true;
                     for dy in 1..=2 {
                         let check_y = y - dy;
-                        if self.is_cave(x, check_y, z) || !self.is_terrain_solid(x, check_y, z, base_height, biome) {
+                        if self.is_cave(x, check_y, z) || !self.is_terrain_solid(x, check_y, z, base_height, flatness) {
                             solid_below = false;
                             break;
                         }
@@ -1085,11 +1156,26 @@ impl WorldGenerator {
         y: i32,
         z: i32,
         surface_height: i32,
+        flatness: f64,
         biome: &CompiledBiome,
         structure_blocks: &HashMap<(i32, i32, i32), BlockType>,
     ) -> BlockType {
+        // Check for ponds/lakes - carve a bowl and fill with water
+        if let Some((water_level, carve_depth)) = self.get_pond_at(x, z, biome) {
+            let pond_bottom = water_level - carve_depth;
+
+            // Fill with water from bottom to water level
+            if y > pond_bottom && y <= water_level {
+                return BlockType::Water;
+            }
+            // Carve out blocks above water level up to terrain surface
+            if y > water_level && y <= surface_height {
+                return BlockType::Air;
+            }
+        }
+
         // Use 3D noise for terrain density - enables overhangs and cliffs
-        let is_solid = self.is_terrain_solid(x, y, z, surface_height, biome);
+        let is_solid = self.is_terrain_solid(x, y, z, surface_height, flatness);
 
         // Check for structures first (they can be above ground)
         if !is_solid {
@@ -1110,7 +1196,7 @@ impl WorldGenerator {
         }
 
         // Determine if this is a surface block by checking if block above is air
-        let above_solid = self.is_terrain_solid(x, y + 1, z, surface_height, biome);
+        let above_solid = self.is_terrain_solid(x, y + 1, z, surface_height, flatness);
         let is_surface = !above_solid;
 
         // Surface block
@@ -1127,7 +1213,7 @@ impl WorldGenerator {
         // Subsurface - check if near any air pocket above
         let mut near_surface = false;
         for dy in 1..=4 {
-            if !self.is_terrain_solid(x, y + dy, z, surface_height, biome) {
+            if !self.is_terrain_solid(x, y + dy, z, surface_height, flatness) {
                 near_surface = true;
                 break;
             }
@@ -1170,6 +1256,9 @@ pub struct World {
     /// Pre-allocated mesh buffers to avoid allocation during updates
     mesh_vertices: Vec<Vertex>,
     mesh_indices: Vec<u32>,
+    /// Pre-allocated water mesh buffers (separate for transparent rendering)
+    water_vertices: Vec<Vertex>,
+    water_indices: Vec<u32>,
     /// Whether the combined mesh needs rebuilding
     mesh_dirty: bool,
     /// Pre-allocated set for desired chunk positions (reused each frame)
@@ -1243,6 +1332,8 @@ impl World {
             last_player_chunk: None,
             mesh_vertices: Vec::with_capacity(estimated_vertices),
             mesh_indices: Vec::with_capacity(estimated_indices),
+            water_vertices: Vec::with_capacity(estimated_vertices / 8), // Water is less common
+            water_indices: Vec::with_capacity(estimated_indices / 8),
             mesh_dirty: true,
             desired_chunks: HashSet::with_capacity(max_chunks),
             biomes_config,
@@ -1567,6 +1658,239 @@ impl World {
         self.collect_world_mesh(frustum)
     }
 
+    /// Generate mesh for world including separate water mesh for transparent rendering
+    /// Returns (terrain_vertices, terrain_indices, water_vertices, water_indices)
+    pub fn generate_world_mesh_with_water(
+        &mut self,
+        texture_indices: &BlockTextureArray,
+        frustum: &Frustum,
+    ) -> (&[Vertex], &[u32], &[Vertex], &[u32]) {
+        self.update_dirty_meshes(texture_indices);
+        self.collect_world_mesh_with_water(texture_indices, frustum)
+    }
+
+    /// Collect meshes from all chunks, separating water from terrain
+    /// Water gets special subdivided meshes for smooth wave displacement
+    fn collect_world_mesh_with_water(
+        &mut self,
+        texture_indices: &BlockTextureArray,
+        frustum: &Frustum,
+    ) -> (&[Vertex], &[u32], &[Vertex], &[u32]) {
+        use crate::voxel::{add_subdivided_water_face, Face};
+
+        // Clear pre-allocated buffers
+        self.mesh_vertices.clear();
+        self.mesh_indices.clear();
+        self.water_vertices.clear();
+        self.water_indices.clear();
+
+        let water_tex_layer = texture_indices[BlockType::Water.as_index()].top;
+        const WATER_SUBDIVISIONS: usize = 4; // 4x4 grid per water block face
+
+        // Collect meshes from visible chunks
+        for chunk in self.chunks.values() {
+            // Frustum culling - skip chunks outside view
+            let chunk_min = glam::Vec3::new(
+                chunk.position[0] as f32 * CHUNK_SIZE as f32,
+                chunk.position[1] as f32 * CHUNK_SIZE as f32,
+                chunk.position[2] as f32 * CHUNK_SIZE as f32,
+            );
+            let chunk_max = chunk_min + glam::Vec3::splat(CHUNK_SIZE as f32);
+
+            if !frustum.intersects_aabb(chunk_min, chunk_max) {
+                continue;
+            }
+
+            // Separate terrain from water - terrain uses existing mesh
+            let mut terrain_vertices = Vec::new();
+            let mut terrain_indices = Vec::new();
+
+            let vertices = &chunk.mesh.vertices;
+            let indices = &chunk.mesh.indices;
+
+            // Copy non-water triangles to terrain
+            let mut i = 0;
+            while i < indices.len() {
+                if i + 2 < indices.len() {
+                    let idx0 = indices[i] as usize;
+                    let idx1 = indices[i + 1] as usize;
+                    let idx2 = indices[i + 2] as usize;
+
+                    if idx0 < vertices.len() && idx1 < vertices.len() && idx2 < vertices.len() {
+                        let is_water = vertices[idx0].tex_layer == water_tex_layer;
+
+                        if !is_water {
+                            let base = terrain_vertices.len() as u32;
+                            terrain_vertices.push(vertices[idx0]);
+                            terrain_vertices.push(vertices[idx1]);
+                            terrain_vertices.push(vertices[idx2]);
+                            terrain_indices.push(base);
+                            terrain_indices.push(base + 1);
+                            terrain_indices.push(base + 2);
+                        }
+                    }
+                }
+                i += 3;
+            }
+
+            // Append terrain mesh
+            if !terrain_vertices.is_empty() {
+                let base_vertex = self.mesh_vertices.len() as u32;
+                self.mesh_vertices.extend_from_slice(&terrain_vertices);
+                for idx in terrain_indices {
+                    self.mesh_indices.push(base_vertex + idx);
+                }
+            }
+
+            // Generate subdivided water mesh by scanning chunk for water blocks
+            // Render all faces exposed to air
+            let chunk_offset = glam::Vec3::new(
+                chunk.position[0] as f32 * CHUNK_SIZE as f32,
+                chunk.position[1] as f32 * CHUNK_SIZE as f32,
+                chunk.position[2] as f32 * CHUNK_SIZE as f32,
+            );
+
+            let chunk_pos = chunk.position;
+
+            for x in 0..CHUNK_SIZE {
+                for y in 0..CHUNK_SIZE {
+                    for z in 0..CHUNK_SIZE {
+                        let block = chunk.get_block(x, y, z);
+                        if block != BlockType::Water {
+                            continue;
+                        }
+
+                        let world_pos = chunk_offset + glam::Vec3::new(x as f32, y as f32, z as f32);
+
+                        // Check each face for air exposure
+                        // Top face (+Y)
+                        let above = if y < CHUNK_SIZE - 1 {
+                            chunk.get_block(x, y + 1, z)
+                        } else {
+                            // Check neighbor chunk above
+                            self.chunks.get(&(chunk_pos[0], chunk_pos[1] + 1, chunk_pos[2]))
+                                .map(|c| c.get_block(x, 0, z))
+                                .unwrap_or(BlockType::Air)
+                        };
+                        if above == BlockType::Air {
+                            add_subdivided_water_face(
+                                &mut self.water_vertices,
+                                &mut self.water_indices,
+                                world_pos,
+                                water_tex_layer,
+                                Face::Top,
+                                WATER_SUBDIVISIONS,
+                            );
+                        }
+
+                        // Bottom face (-Y)
+                        let below = if y > 0 {
+                            chunk.get_block(x, y - 1, z)
+                        } else {
+                            self.chunks.get(&(chunk_pos[0], chunk_pos[1] - 1, chunk_pos[2]))
+                                .map(|c| c.get_block(x, CHUNK_SIZE - 1, z))
+                                .unwrap_or(BlockType::Air)
+                        };
+                        if below == BlockType::Air {
+                            add_subdivided_water_face(
+                                &mut self.water_vertices,
+                                &mut self.water_indices,
+                                world_pos,
+                                water_tex_layer,
+                                Face::Bottom,
+                                WATER_SUBDIVISIONS,
+                            );
+                        }
+
+                        // Front face (+Z)
+                        let front = if z < CHUNK_SIZE - 1 {
+                            chunk.get_block(x, y, z + 1)
+                        } else {
+                            self.chunks.get(&(chunk_pos[0], chunk_pos[1], chunk_pos[2] + 1))
+                                .map(|c| c.get_block(x, y, 0))
+                                .unwrap_or(BlockType::Air)
+                        };
+                        if front == BlockType::Air {
+                            add_subdivided_water_face(
+                                &mut self.water_vertices,
+                                &mut self.water_indices,
+                                world_pos,
+                                water_tex_layer,
+                                Face::Front,
+                                WATER_SUBDIVISIONS,
+                            );
+                        }
+
+                        // Back face (-Z)
+                        let back = if z > 0 {
+                            chunk.get_block(x, y, z - 1)
+                        } else {
+                            self.chunks.get(&(chunk_pos[0], chunk_pos[1], chunk_pos[2] - 1))
+                                .map(|c| c.get_block(x, y, CHUNK_SIZE - 1))
+                                .unwrap_or(BlockType::Air)
+                        };
+                        if back == BlockType::Air {
+                            add_subdivided_water_face(
+                                &mut self.water_vertices,
+                                &mut self.water_indices,
+                                world_pos,
+                                water_tex_layer,
+                                Face::Back,
+                                WATER_SUBDIVISIONS,
+                            );
+                        }
+
+                        // Right face (+X)
+                        let right = if x < CHUNK_SIZE - 1 {
+                            chunk.get_block(x + 1, y, z)
+                        } else {
+                            self.chunks.get(&(chunk_pos[0] + 1, chunk_pos[1], chunk_pos[2]))
+                                .map(|c| c.get_block(0, y, z))
+                                .unwrap_or(BlockType::Air)
+                        };
+                        if right == BlockType::Air {
+                            add_subdivided_water_face(
+                                &mut self.water_vertices,
+                                &mut self.water_indices,
+                                world_pos,
+                                water_tex_layer,
+                                Face::Right,
+                                WATER_SUBDIVISIONS,
+                            );
+                        }
+
+                        // Left face (-X)
+                        let left = if x > 0 {
+                            chunk.get_block(x - 1, y, z)
+                        } else {
+                            self.chunks.get(&(chunk_pos[0] - 1, chunk_pos[1], chunk_pos[2]))
+                                .map(|c| c.get_block(CHUNK_SIZE - 1, y, z))
+                                .unwrap_or(BlockType::Air)
+                        };
+                        if left == BlockType::Air {
+                            add_subdivided_water_face(
+                                &mut self.water_vertices,
+                                &mut self.water_indices,
+                                world_pos,
+                                water_tex_layer,
+                                Face::Left,
+                                WATER_SUBDIVISIONS,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        self.mesh_dirty = false;
+        (
+            &self.mesh_vertices,
+            &self.mesh_indices,
+            &self.water_vertices,
+            &self.water_indices,
+        )
+    }
+
     /// Set a block at world coordinates and mark affected chunks for remeshing
     /// Returns true if the block was successfully set
     pub fn set_block(&mut self, world_x: i32, world_y: i32, world_z: i32, block: BlockType) -> bool {
@@ -1678,5 +2002,11 @@ impl World {
         }
 
         self.set_block(world_x, world_y, world_z, block)
+    }
+
+    /// Get the biome name at a world position
+    pub fn get_biome_name(&self, world_x: f32, world_z: f32) -> &str {
+        let biome = self.generator.get_biome(world_x as i32, world_z as i32);
+        &biome.name
     }
 }

@@ -13,6 +13,46 @@ use crate::worldgen::World;
 /// Shadow map resolution (higher = better quality shadows but more expensive)
 const SHADOW_MAP_SIZE: u32 = 2048;
 
+/// Water uniform containing animation and appearance properties
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct WaterUniform {
+    time: f32,
+    wave_speed: f32,
+    wave_height: f32,
+    transparency: f32,
+    shallow_color: [f32; 3],
+    _pad1: f32,
+    deep_color: [f32; 3],
+    _pad2: f32,
+    camera_position: [f32; 3],
+    _pad3: f32,
+}
+
+impl WaterUniform {
+    pub fn new() -> Self {
+        Self {
+            time: 0.0,
+            wave_speed: 1.0,
+            wave_height: 1.0,
+            transparency: 0.7,
+            // Beautiful turquoise shallow water
+            shallow_color: [0.1, 0.6, 0.6],
+            _pad1: 0.0,
+            // Deep blue for deeper water
+            deep_color: [0.02, 0.15, 0.3],
+            _pad2: 0.0,
+            camera_position: [0.0, 0.0, 0.0],
+            _pad3: 0.0,
+        }
+    }
+
+    pub fn update(&mut self, time: f32, camera_pos: Vec3) {
+        self.time = time;
+        self.camera_position = camera_pos.to_array();
+    }
+}
+
 /// Light uniform containing sun direction, color, and light-space matrix
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -265,11 +305,16 @@ pub struct Renderer {
     shadow_pipeline: wgpu::RenderPipeline,
     sky_pipeline: wgpu::RenderPipeline,
     selection_pipeline: wgpu::RenderPipeline,
+    water_pipeline: wgpu::RenderPipeline,
     // Double-buffered vertex/index buffers to avoid GPU contention
     vertex_buffers: [wgpu::Buffer; 2],
     index_buffers: [wgpu::Buffer; 2],
     num_indices: [u32; 2],
     current_buffer: usize,
+    // Water mesh buffers (separate from terrain for transparent rendering)
+    water_vertex_buffers: [wgpu::Buffer; 2],
+    water_index_buffers: [wgpu::Buffer; 2],
+    water_num_indices: [u32; 2],
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     texture_bind_group: wgpu::BindGroup,
@@ -282,6 +327,10 @@ pub struct Renderer {
     sky_buffer: wgpu::Buffer,
     sky_bind_group: wgpu::BindGroup,
     sky_uniform: SkyUniform,
+    // Water rendering
+    water_buffer: wgpu::Buffer,
+    water_bind_group: wgpu::BindGroup,
+    water_uniform: WaterUniform,
     // Selection box rendering
     selection_vertex_buffer: wgpu::Buffer,
     selection_index_buffer: wgpu::Buffer,
@@ -298,7 +347,7 @@ pub struct Renderer {
     day_length: f32,
     /// Whether time is frozen
     time_frozen: bool,
-    /// Animation time for selection pulse
+    /// Animation time for selection pulse and water waves
     animation_time: f32,
 }
 
@@ -875,6 +924,112 @@ impl Renderer {
             cache: None,
         });
 
+        // Water shader and pipeline
+        let water_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Water Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("water.wgsl").into()),
+        });
+
+        // Water uniform buffer
+        let water_uniform = WaterUniform::new();
+        let water_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Water Buffer"),
+            contents: bytemuck::cast_slice(&[water_uniform]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let water_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+                label: Some("water_bind_group_layout"),
+            });
+
+        let water_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &water_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: water_buffer.as_entire_binding(),
+            }],
+            label: Some("water_bind_group"),
+        });
+
+        let water_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Water Pipeline Layout"),
+                bind_group_layouts: &[
+                    &camera_bind_group_layout,
+                    &water_bind_group_layout,
+                    &light_bind_group_layout,
+                    &texture_bind_group_layout,
+                ],
+                push_constant_ranges: &[],
+            });
+
+        let water_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Water Pipeline"),
+            layout: Some(&water_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &water_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[Vertex::desc()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &water_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    // Alpha blending for transparent water
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::SrcAlpha,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None, // Render both sides of water
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false, // Don't write depth for transparent water
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        });
+
         // Calculate buffer sizes based on render distance
         let (vertex_buffer_size, index_buffer_size) = calculate_buffer_sizes(render_distance, height_chunks);
 
@@ -909,6 +1064,40 @@ impl Renderer {
             }),
         ];
 
+        // Water buffers (smaller - water is less common than terrain)
+        let water_buffer_size = vertex_buffer_size / 8; // Water is ~1/8 of terrain
+        let water_index_size = index_buffer_size / 8;
+
+        let water_vertex_buffers = [
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Water Vertex Buffer 0"),
+                size: water_buffer_size.max(1024 * 1024), // Min 1MB
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Water Vertex Buffer 1"),
+                size: water_buffer_size.max(1024 * 1024),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+        ];
+
+        let water_index_buffers = [
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Water Index Buffer 0"),
+                size: water_index_size.max(512 * 1024), // Min 512KB
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Water Index Buffer 1"),
+                size: water_index_size.max(512 * 1024),
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+        ];
+
         // Build fast block texture lookup array (O(1) indexing instead of HashMap)
         let block_textures = texture_manager.create_texture_array_lookup();
 
@@ -922,10 +1111,14 @@ impl Renderer {
             shadow_pipeline,
             sky_pipeline,
             selection_pipeline,
+            water_pipeline,
             vertex_buffers,
             index_buffers,
             num_indices: [0, 0],
             current_buffer: 0,
+            water_vertex_buffers,
+            water_index_buffers,
+            water_num_indices: [0, 0],
             camera_buffer,
             camera_bind_group,
             texture_bind_group,
@@ -938,6 +1131,9 @@ impl Renderer {
             sky_buffer,
             sky_bind_group,
             sky_uniform,
+            water_buffer,
+            water_bind_group,
+            water_uniform,
             selection_vertex_buffer,
             selection_index_buffer,
             selection_num_indices,
@@ -983,7 +1179,7 @@ impl Renderer {
 
     /// Update time of day and lighting. Call this each frame with delta time.
     pub fn update_time(&mut self, dt: f32, camera_pos: Vec3) {
-        // Update animation time (always advances for selection pulse)
+        // Update animation time (always advances for selection pulse and water waves)
         self.animation_time += dt;
 
         // Advance game time (only if not frozen)
@@ -1005,6 +1201,14 @@ impl Renderer {
             &self.light_buffer,
             0,
             bytemuck::cast_slice(&[self.light_uniform]),
+        );
+
+        // Update water uniform with animation time
+        self.water_uniform.update(self.animation_time, camera_pos);
+        self.queue.write_buffer(
+            &self.water_buffer,
+            0,
+            bytemuck::cast_slice(&[self.water_uniform]),
         );
     }
 
@@ -1095,14 +1299,14 @@ impl Renderer {
     pub fn update_world(&mut self, world: &mut World, frustum: &Frustum) {
         // Use World's mesh generation which handles neighbor culling and frustum culling
         // Returns slices into pre-allocated buffers (no allocation)
-        let (all_vertices, all_indices) = world.generate_world_mesh(&self.block_textures, frustum);
+        let (all_vertices, all_indices, water_vertices, water_indices) =
+            world.generate_world_mesh_with_water(&self.block_textures, frustum);
+
+        let write_buffer = 1 - self.current_buffer;
 
         if !all_vertices.is_empty() {
             let vertex_bytes = bytemuck::cast_slice(all_vertices);
             let index_bytes = bytemuck::cast_slice(all_indices);
-
-            // Write to the OTHER buffer (not the one being rendered)
-            let write_buffer = 1 - self.current_buffer;
 
             // Ensure buffers are large enough, reallocate if needed
             self.ensure_buffer_size(write_buffer, vertex_bytes.len() as u64, index_bytes.len() as u64);
@@ -1127,9 +1331,6 @@ impl Renderer {
             self.queue.write_buffer(&self.index_buffers[write_buffer], 0, index_bytes);
             self.num_indices[write_buffer] = all_indices.len() as u32;
 
-            // Swap to the newly written buffer for next render
-            self.current_buffer = write_buffer;
-
             log::debug!(
                 "Uploaded {} vertices, {} indices to buffer {}",
                 all_vertices.len(),
@@ -1137,6 +1338,32 @@ impl Renderer {
                 write_buffer
             );
         }
+
+        // Upload water mesh data
+        if !water_vertices.is_empty() {
+            let vertex_bytes = bytemuck::cast_slice(water_vertices);
+            let index_bytes = bytemuck::cast_slice(water_indices);
+
+            // Check buffer sizes for water
+            if vertex_bytes.len() as u64 <= self.water_vertex_buffers[write_buffer].size()
+                && index_bytes.len() as u64 <= self.water_index_buffers[write_buffer].size()
+            {
+                self.queue.write_buffer(&self.water_vertex_buffers[write_buffer], 0, vertex_bytes);
+                self.queue.write_buffer(&self.water_index_buffers[write_buffer], 0, index_bytes);
+                self.water_num_indices[write_buffer] = water_indices.len() as u32;
+
+                log::debug!(
+                    "Uploaded {} water vertices, {} water indices",
+                    water_vertices.len(),
+                    water_indices.len()
+                );
+            }
+        } else {
+            self.water_num_indices[write_buffer] = 0;
+        }
+
+        // Swap to the newly written buffer for next render
+        self.current_buffer = write_buffer;
     }
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -1220,6 +1447,21 @@ impl Renderer {
                 wgpu::IndexFormat::Uint32,
             );
             render_pass.draw_indexed(0..self.num_indices[self.current_buffer], 0, 0..1);
+
+            // Render water (transparent, after opaque terrain)
+            if self.water_num_indices[self.current_buffer] > 0 {
+                render_pass.set_pipeline(&self.water_pipeline);
+                render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                render_pass.set_bind_group(1, &self.water_bind_group, &[]);
+                render_pass.set_bind_group(2, &self.light_bind_group, &[]);
+                render_pass.set_bind_group(3, &self.texture_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, self.water_vertex_buffers[self.current_buffer].slice(..));
+                render_pass.set_index_buffer(
+                    self.water_index_buffers[self.current_buffer].slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                render_pass.draw_indexed(0..self.water_num_indices[self.current_buffer], 0, 0..1);
+            }
 
             // Render selection box overlay if active
             if self.selection_active {

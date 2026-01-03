@@ -108,7 +108,21 @@ impl BlockType {
             return true;
         }
 
-        // For other transparent blocks (water, ice), render unless adjacent is the same type
+        // Special handling for water
+        if *self == BlockType::Water {
+            // Don't render water faces against solid opaque blocks (underwater faces)
+            if !adjacent.is_transparent() {
+                return false;
+            }
+            // Don't render water-to-water faces (prevents internal faces)
+            if adjacent == BlockType::Water {
+                return false;
+            }
+            // Render against air (handled above) and other transparent blocks
+            return true;
+        }
+
+        // For other transparent blocks (ice), render unless adjacent is the same type
         // This prevents z-fighting between identical transparent blocks
         if self.is_transparent() {
             return *self != adjacent;
@@ -1574,4 +1588,148 @@ fn add_greedy_face(
         base_index + 2,
         base_index + 3,
     ]);
+}
+
+/// Add a subdivided water face with more vertices for smooth wave displacement
+/// subdivisions: number of subdivisions per axis (e.g., 4 means 4x4 = 16 quads per face)
+pub fn add_subdivided_water_face(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    pos: Vec3,
+    tex_layer: u32,
+    face: Face,
+    subdivisions: usize,
+) {
+    let base_index = vertices.len() as u32;
+    let step = 1.0 / subdivisions as f32;
+    let normal = match face {
+        Face::Top => [0.0, 1.0, 0.0],
+        Face::Bottom => [0.0, -1.0, 0.0],
+        Face::Left => [-1.0, 0.0, 0.0],
+        Face::Right => [1.0, 0.0, 0.0],
+        Face::Front => [0.0, 0.0, 1.0],
+        Face::Back => [0.0, 0.0, -1.0],
+    };
+
+    // Generate grid of vertices
+    let grid_size = subdivisions + 1;
+
+    match face {
+        Face::Top => {
+            // Top face: Y is constant at pos.y + 1, grid on X-Z plane
+            for row in 0..grid_size {
+                for col in 0..grid_size {
+                    let u = col as f32 * step;
+                    let v = row as f32 * step;
+                    vertices.push(Vertex {
+                        position: [pos.x + u, pos.y + 1.0, pos.z + v],
+                        uv: [u, v],
+                        normal,
+                        tex_layer,
+                        ao: 1.0, // No AO for water
+                    });
+                }
+            }
+        }
+        Face::Bottom => {
+            // Bottom face: Y is constant at pos.y, grid on X-Z plane
+            for row in 0..grid_size {
+                for col in 0..grid_size {
+                    let u = col as f32 * step;
+                    let v = row as f32 * step;
+                    vertices.push(Vertex {
+                        position: [pos.x + u, pos.y, pos.z + v],
+                        uv: [u, v],
+                        normal,
+                        tex_layer,
+                        ao: 1.0,
+                    });
+                }
+            }
+        }
+        _ => {
+            // For side faces, we don't need subdivision as much
+            // Just add a simple quad
+            let (positions, uvs) = match face {
+                Face::Left => (
+                    [
+                        [pos.x, pos.y, pos.z],
+                        [pos.x, pos.y, pos.z + 1.0],
+                        [pos.x, pos.y + 1.0, pos.z + 1.0],
+                        [pos.x, pos.y + 1.0, pos.z],
+                    ],
+                    [[1.0, 1.0], [0.0, 1.0], [0.0, 0.0], [1.0, 0.0]],
+                ),
+                Face::Right => (
+                    [
+                        [pos.x + 1.0, pos.y, pos.z + 1.0],
+                        [pos.x + 1.0, pos.y, pos.z],
+                        [pos.x + 1.0, pos.y + 1.0, pos.z],
+                        [pos.x + 1.0, pos.y + 1.0, pos.z + 1.0],
+                    ],
+                    [[1.0, 1.0], [0.0, 1.0], [0.0, 0.0], [1.0, 0.0]],
+                ),
+                Face::Front => (
+                    [
+                        [pos.x, pos.y, pos.z + 1.0],
+                        [pos.x + 1.0, pos.y, pos.z + 1.0],
+                        [pos.x + 1.0, pos.y + 1.0, pos.z + 1.0],
+                        [pos.x, pos.y + 1.0, pos.z + 1.0],
+                    ],
+                    [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+                ),
+                Face::Back => (
+                    [
+                        [pos.x + 1.0, pos.y, pos.z],
+                        [pos.x, pos.y, pos.z],
+                        [pos.x, pos.y + 1.0, pos.z],
+                        [pos.x + 1.0, pos.y + 1.0, pos.z],
+                    ],
+                    [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+                ),
+                _ => unreachable!(),
+            };
+
+            for i in 0..4 {
+                vertices.push(Vertex {
+                    position: positions[i],
+                    uv: uvs[i],
+                    normal,
+                    tex_layer,
+                    ao: 1.0,
+                });
+            }
+
+            // Simple quad indices
+            indices.extend_from_slice(&[
+                base_index,
+                base_index + 1,
+                base_index + 2,
+                base_index,
+                base_index + 2,
+                base_index + 3,
+            ]);
+            return;
+        }
+    }
+
+    // Generate indices for the subdivided grid (Top and Bottom faces)
+    for row in 0..subdivisions {
+        for col in 0..subdivisions {
+            let top_left = base_index + (row * grid_size + col) as u32;
+            let top_right = top_left + 1;
+            let bottom_left = top_left + grid_size as u32;
+            let bottom_right = bottom_left + 1;
+
+            // Two triangles per cell
+            indices.extend_from_slice(&[
+                top_left,
+                bottom_left,
+                bottom_right,
+                top_left,
+                bottom_right,
+                top_right,
+            ]);
+        }
+    }
 }
