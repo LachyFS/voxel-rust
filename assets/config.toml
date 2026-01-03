@@ -24,19 +24,19 @@ terrain_height = 64.0
 # === Cave Generation ===
 # Worm/Spaghetti caves - main tunnel system
 # Scale (smaller = longer, more winding tunnels)
-cave_worm_scale = 0.018
-# Threshold (larger = wider tunnels, 0.02-0.06)
-cave_worm_threshold = 0.025
+cave_worm_scale = 0.02
+# Threshold (larger = wider tunnels, 0.02-0.08)
+cave_worm_threshold = 0.045
 
 # Cheese caves - larger open caverns (set threshold to 1.0 to disable)
 # Scale (smaller = larger caverns)
-cave_cheese_scale = 0.05
-# Threshold (higher = fewer/smaller caves, 0.65-0.85)
-cave_cheese_threshold = 0.1
+cave_cheese_scale = 0.04
+# Threshold (lower = more caves, 0.6-0.85)
+cave_cheese_threshold = 0.7
 
 # Secondary tunnel layer (set threshold to 1.0 to disable)
-cave_scale = 0.05
-cave_threshold = 0.4
+cave_scale = 0.04
+cave_threshold = 0.5
 
 # === Ravine Generation ===
 # Scale (smaller = longer ravines)
