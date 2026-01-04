@@ -6,7 +6,7 @@ use crate::camera::Frustum;
 use crate::config::{CompiledBiome, CompiledBiomesConfig, TerrainConfig};
 use crate::fluid::MAX_WATER_LEVEL;
 use crate::texture::BlockTextureArray;
-use crate::voxel::{add_water_face, add_water_side_face, BlockType, Chunk, ChunkNeighbors, Face, NeighborBoundaries, Vertex, CHUNK_SIZE};
+use crate::voxel::{add_smooth_water_top, add_water_face, add_water_side_face, add_waterfall, BlockType, Chunk, ChunkNeighbors, Face, NeighborBoundaries, Vertex, WaterNeighborLevels, CHUNK_SIZE};
 use glam::Vec3;
 
 // ============================================================================
@@ -1698,16 +1698,38 @@ impl World {
 
         let water_tex_layer = texture_indices[BlockType::Water.as_index()].top;
 
-        // Helper to get neighbor water level for blocks we already know are water
-        // If fluid_sim returns 0 for a water block, it's unregistered - treat as full
-        let get_neighbor_water_level = |fluid_sim: Option<&crate::fluid::FluidSimulator>, wx: i32, wy: i32, wz: i32| -> u8 {
-            match fluid_sim {
-                Some(sim) => {
-                    let level = sim.get_water_level(wx, wy, wz);
-                    // If level is 0, the water block isn't registered yet - treat as full
-                    if level == 0 { MAX_WATER_LEVEL } else { level }
+        // Helper to get block at world coordinates (using chunks HashMap directly)
+        let get_block_at = |chunks: &HashMap<(i32, i32, i32), Chunk>, wx: i32, wy: i32, wz: i32| -> Option<BlockType> {
+            let chunk_size = CHUNK_SIZE as i32;
+            let chunk_pos = (
+                wx.div_euclid(chunk_size),
+                wy.div_euclid(chunk_size),
+                wz.div_euclid(chunk_size),
+            );
+            let chunk = chunks.get(&chunk_pos)?;
+            let local_x = wx.rem_euclid(chunk_size) as usize;
+            let local_y = wy.rem_euclid(chunk_size) as usize;
+            let local_z = wz.rem_euclid(chunk_size) as usize;
+            Some(chunk.get_block(local_x, local_y, local_z))
+        };
+
+        // Helper to get neighbor water level - returns 0 if neighbor is not water
+        // This is used for smooth water interpolation
+        let get_neighbor_water_level = |chunks: &HashMap<(i32, i32, i32), Chunk>, fluid_sim: Option<&crate::fluid::FluidSimulator>, wx: i32, wy: i32, wz: i32| -> u8 {
+            // First check if neighbor is actually water
+            match get_block_at(chunks, wx, wy, wz) {
+                Some(BlockType::Water) => {
+                    // It's water - get the fluid level
+                    match fluid_sim {
+                        Some(sim) => {
+                            let level = sim.get_water_level(wx, wy, wz);
+                            // If level is 0, the water block isn't registered yet - treat as full
+                            if level == 0 { MAX_WATER_LEVEL } else { level }
+                        }
+                        None => MAX_WATER_LEVEL,
+                    }
                 }
-                None => MAX_WATER_LEVEL,
+                _ => 0, // Not water - return 0 to exclude from averaging
             }
         };
 
@@ -1807,13 +1829,24 @@ impl World {
                                 .unwrap_or(BlockType::Air)
                         };
                         if above == BlockType::Air {
-                            add_water_face(
+                            // Gather neighbor water levels for smooth interpolation
+                            let neighbors = WaterNeighborLevels {
+                                neg_x: get_neighbor_water_level(&self.chunks, fluid_sim, world_x - 1, world_y, world_z),
+                                pos_x: get_neighbor_water_level(&self.chunks, fluid_sim, world_x + 1, world_y, world_z),
+                                neg_z: get_neighbor_water_level(&self.chunks, fluid_sim, world_x, world_y, world_z - 1),
+                                pos_z: get_neighbor_water_level(&self.chunks, fluid_sim, world_x, world_y, world_z + 1),
+                                neg_x_neg_z: get_neighbor_water_level(&self.chunks, fluid_sim, world_x - 1, world_y, world_z - 1),
+                                pos_x_neg_z: get_neighbor_water_level(&self.chunks, fluid_sim, world_x + 1, world_y, world_z - 1),
+                                neg_x_pos_z: get_neighbor_water_level(&self.chunks, fluid_sim, world_x - 1, world_y, world_z + 1),
+                                pos_x_pos_z: get_neighbor_water_level(&self.chunks, fluid_sim, world_x + 1, world_y, world_z + 1),
+                            };
+                            add_smooth_water_top(
                                 &mut self.water_vertices,
                                 &mut self.water_indices,
                                 world_pos,
                                 water_tex_layer,
-                                Face::Top,
                                 water_level,
+                                &neighbors,
                             );
                         }
 
@@ -1853,9 +1886,22 @@ impl World {
                                 Face::Front,
                                 water_level,
                             );
+                            // Check for waterfall: is there a drop below the front neighbor?
+                            let drop = self.count_air_drop(world_x, world_y - 1, world_z + 1);
+                            if drop > 0 {
+                                add_waterfall(
+                                    &mut self.water_vertices,
+                                    &mut self.water_indices,
+                                    world_pos,
+                                    water_tex_layer,
+                                    Face::Front,
+                                    water_level,
+                                    drop,
+                                );
+                            }
                         } else if front == BlockType::Water {
                             // Check if neighbor water has lower level - render exposed strip
-                            let neighbor_level = get_neighbor_water_level(fluid_sim, world_x, world_y, world_z + 1);
+                            let neighbor_level = get_neighbor_water_level(&self.chunks, fluid_sim, world_x, world_y, world_z + 1);
                             if neighbor_level < water_level {
                                 add_water_side_face(
                                     &mut self.water_vertices,
@@ -1886,8 +1932,21 @@ impl World {
                                 Face::Back,
                                 water_level,
                             );
+                            // Check for waterfall
+                            let drop = self.count_air_drop(world_x, world_y - 1, world_z - 1);
+                            if drop > 0 {
+                                add_waterfall(
+                                    &mut self.water_vertices,
+                                    &mut self.water_indices,
+                                    world_pos,
+                                    water_tex_layer,
+                                    Face::Back,
+                                    water_level,
+                                    drop,
+                                );
+                            }
                         } else if back == BlockType::Water {
-                            let neighbor_level = get_neighbor_water_level(fluid_sim, world_x, world_y, world_z - 1);
+                            let neighbor_level = get_neighbor_water_level(&self.chunks, fluid_sim, world_x, world_y, world_z - 1);
                             if neighbor_level < water_level {
                                 add_water_side_face(
                                     &mut self.water_vertices,
@@ -1918,8 +1977,21 @@ impl World {
                                 Face::Right,
                                 water_level,
                             );
+                            // Check for waterfall
+                            let drop = self.count_air_drop(world_x + 1, world_y - 1, world_z);
+                            if drop > 0 {
+                                add_waterfall(
+                                    &mut self.water_vertices,
+                                    &mut self.water_indices,
+                                    world_pos,
+                                    water_tex_layer,
+                                    Face::Right,
+                                    water_level,
+                                    drop,
+                                );
+                            }
                         } else if right == BlockType::Water {
-                            let neighbor_level = get_neighbor_water_level(fluid_sim, world_x + 1, world_y, world_z);
+                            let neighbor_level = get_neighbor_water_level(&self.chunks, fluid_sim, world_x + 1, world_y, world_z);
                             if neighbor_level < water_level {
                                 add_water_side_face(
                                     &mut self.water_vertices,
@@ -1950,8 +2022,21 @@ impl World {
                                 Face::Left,
                                 water_level,
                             );
+                            // Check for waterfall
+                            let drop = self.count_air_drop(world_x - 1, world_y - 1, world_z);
+                            if drop > 0 {
+                                add_waterfall(
+                                    &mut self.water_vertices,
+                                    &mut self.water_indices,
+                                    world_pos,
+                                    water_tex_layer,
+                                    Face::Left,
+                                    water_level,
+                                    drop,
+                                );
+                            }
                         } else if left == BlockType::Water {
-                            let neighbor_level = get_neighbor_water_level(fluid_sim, world_x - 1, world_y, world_z);
+                            let neighbor_level = get_neighbor_water_level(&self.chunks, fluid_sim, world_x - 1, world_y, world_z);
                             if neighbor_level < water_level {
                                 add_water_side_face(
                                     &mut self.water_vertices,
@@ -2060,6 +2145,20 @@ impl World {
         let local_z = world_z.rem_euclid(chunk_size) as usize;
 
         Some(chunk.get_block(local_x, local_y, local_z))
+    }
+
+    /// Count how many air blocks are below a given position (for waterfall detection)
+    /// Returns 0-16, capped for performance
+    pub fn count_air_drop(&self, world_x: i32, start_y: i32, world_z: i32) -> u8 {
+        let mut drop = 0u8;
+        for dy in 0..16i32 {
+            let check_y = start_y - dy;
+            match self.get_block(world_x, check_y, world_z) {
+                Some(BlockType::Air) => drop += 1,
+                _ => break,
+            }
+        }
+        drop
     }
 
     /// Destroy a block at world coordinates (set to Air)

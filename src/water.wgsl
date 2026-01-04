@@ -61,6 +61,7 @@ struct VertexOutput {
     @location(2) @interpolate(flat) tex_layer: u32,
     @location(3) view_dir: vec3<f32>,
     @location(4) normal: vec3<f32>,
+    @location(5) ao: f32, // Water level (0-1) or waterfall indicator (>1)
 };
 
 // Simplex noise for wave animation
@@ -199,6 +200,7 @@ fn vs_main(model: VertexInput) -> VertexOutput {
     out.tex_layer = model.tex_layer;
     out.view_dir = normalize(water.camera_position - pos);
     out.normal = model.normal;
+    out.ao = model.ao;
 
     return out;
 }
@@ -233,8 +235,54 @@ fn specular_highlight(view_dir: vec3<f32>, normal: vec3<f32>, light_dir: vec3<f3
     return spec;
 }
 
+// Waterfall noise pattern
+fn waterfall_noise(uv: vec2<f32>, time: f32) -> f32 {
+    // Animated vertical streaks
+    let scroll_speed = 3.0;
+    let scrolled_uv = vec2<f32>(uv.x, uv.y + time * scroll_speed);
+
+    // Multiple octaves of noise for detail
+    let noise1 = snoise(scrolled_uv * vec2<f32>(2.0, 1.0)) * 0.5;
+    let noise2 = snoise(scrolled_uv * vec2<f32>(4.0, 2.0) + vec2<f32>(100.0, 0.0)) * 0.25;
+    let noise3 = snoise(scrolled_uv * vec2<f32>(8.0, 4.0) + vec2<f32>(200.0, 0.0)) * 0.125;
+
+    return 0.5 + noise1 + noise2 + noise3;
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Check if this is a waterfall (ao > 1.0)
+    let is_waterfall = in.ao > 1.0;
+
+    if is_waterfall {
+        // Waterfall rendering
+        let fall_height = (in.ao - 1.0) * 16.0; // Decode fall height
+
+        // Animated scrolling effect using UV.y (which encodes vertical position)
+        let noise = waterfall_noise(in.uv, water.time);
+
+        // Foam/white water effect - more at top, fading down
+        let foam_factor = max(0.0, 1.0 - in.uv.y / fall_height) * 0.5;
+
+        // Base waterfall color - lighter/foamier
+        let waterfall_base = mix(water.shallow_color, vec3<f32>(0.7, 0.85, 0.95), foam_factor);
+
+        // Add noise variation
+        let varied_color = waterfall_base * (0.8 + noise * 0.4);
+
+        // Lighting
+        let sun_dir = normalize(light.sun_direction);
+        let ndotl = max(dot(in.normal, sun_dir), 0.0);
+        let lit_color = varied_color * (light.ambient_color * 0.9 + light.sun_color * ndotl * 0.3);
+
+        // More transparent at edges, opaque in middle
+        let edge_fade = 1.0 - abs(in.uv.x - 0.5) * 2.0;
+        let alpha = 0.6 + foam_factor * 0.3 + edge_fade * 0.1;
+
+        return vec4<f32>(lit_color, alpha);
+    }
+
+    // Regular water rendering
     // Calculate animated wave normal for top faces
     var normal = in.normal;
     if in.normal.y > 0.5 {

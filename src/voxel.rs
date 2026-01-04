@@ -1783,3 +1783,215 @@ pub fn add_water_side_face(
         base_index + 3,
     ]);
 }
+
+/// Neighbor water levels for smooth interpolation
+/// Order: [neg_x, pos_x, neg_z, pos_z, neg_x_neg_z, pos_x_neg_z, neg_x_pos_z, pos_x_pos_z]
+/// Value of 0 means no water (treat as air/solid for edge detection)
+#[derive(Clone, Copy, Default)]
+pub struct WaterNeighborLevels {
+    pub neg_x: u8,      // -X neighbor
+    pub pos_x: u8,      // +X neighbor
+    pub neg_z: u8,      // -Z neighbor
+    pub pos_z: u8,      // +Z neighbor
+    pub neg_x_neg_z: u8, // -X,-Z corner
+    pub pos_x_neg_z: u8, // +X,-Z corner
+    pub neg_x_pos_z: u8, // -X,+Z corner
+    pub pos_x_pos_z: u8, // +X,+Z corner
+}
+
+/// Add a smooth water top face with interpolated corner heights
+/// This creates smooth transitions between different water levels
+pub fn add_smooth_water_top(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    pos: Vec3,
+    tex_layer: u32,
+    water_level: u8,
+    neighbors: &WaterNeighborLevels,
+) {
+    let base_index = vertices.len() as u32;
+
+    // Calculate corner heights by averaging with neighbors
+    // Corner order: (0,0), (0,1), (1,1), (1,0) in (x,z)
+
+    // Helper to convert level to height
+    let level_to_height = |level: u8| -> f32 {
+        if level == 0 {
+            0.0 // No water
+        } else {
+            let frac = level as f32 / 16.0;
+            frac * 0.9375 + 0.0625
+        }
+    };
+
+    // Average corner heights from surrounding blocks
+    // Corner at (0,0) - average of self, neg_x, neg_z, neg_x_neg_z
+    let corner_00 = {
+        let mut sum = water_level as f32;
+        let mut count = 1.0;
+        if neighbors.neg_x > 0 { sum += neighbors.neg_x as f32; count += 1.0; }
+        if neighbors.neg_z > 0 { sum += neighbors.neg_z as f32; count += 1.0; }
+        if neighbors.neg_x_neg_z > 0 { sum += neighbors.neg_x_neg_z as f32; count += 1.0; }
+        level_to_height((sum / count) as u8)
+    };
+
+    // Corner at (0,1) - average of self, neg_x, pos_z, neg_x_pos_z
+    let corner_01 = {
+        let mut sum = water_level as f32;
+        let mut count = 1.0;
+        if neighbors.neg_x > 0 { sum += neighbors.neg_x as f32; count += 1.0; }
+        if neighbors.pos_z > 0 { sum += neighbors.pos_z as f32; count += 1.0; }
+        if neighbors.neg_x_pos_z > 0 { sum += neighbors.neg_x_pos_z as f32; count += 1.0; }
+        level_to_height((sum / count) as u8)
+    };
+
+    // Corner at (1,1) - average of self, pos_x, pos_z, pos_x_pos_z
+    let corner_11 = {
+        let mut sum = water_level as f32;
+        let mut count = 1.0;
+        if neighbors.pos_x > 0 { sum += neighbors.pos_x as f32; count += 1.0; }
+        if neighbors.pos_z > 0 { sum += neighbors.pos_z as f32; count += 1.0; }
+        if neighbors.pos_x_pos_z > 0 { sum += neighbors.pos_x_pos_z as f32; count += 1.0; }
+        level_to_height((sum / count) as u8)
+    };
+
+    // Corner at (1,0) - average of self, pos_x, neg_z, pos_x_neg_z
+    let corner_10 = {
+        let mut sum = water_level as f32;
+        let mut count = 1.0;
+        if neighbors.pos_x > 0 { sum += neighbors.pos_x as f32; count += 1.0; }
+        if neighbors.neg_z > 0 { sum += neighbors.neg_z as f32; count += 1.0; }
+        if neighbors.pos_x_neg_z > 0 { sum += neighbors.pos_x_neg_z as f32; count += 1.0; }
+        level_to_height((sum / count) as u8)
+    };
+
+    let positions = [
+        [pos.x, pos.y + corner_00, pos.z],           // (0,0)
+        [pos.x, pos.y + corner_01, pos.z + 1.0],     // (0,1)
+        [pos.x + 1.0, pos.y + corner_11, pos.z + 1.0], // (1,1)
+        [pos.x + 1.0, pos.y + corner_10, pos.z],     // (1,0)
+    ];
+
+    let uvs = [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]];
+    let normal = [0.0, 1.0, 0.0];
+    let height_fraction = water_level as f32 / 16.0;
+
+    for i in 0..4 {
+        vertices.push(Vertex {
+            position: positions[i],
+            uv: uvs[i],
+            normal,
+            tex_layer,
+            ao: height_fraction,
+        });
+    }
+
+    indices.extend_from_slice(&[
+        base_index,
+        base_index + 1,
+        base_index + 2,
+        base_index,
+        base_index + 2,
+        base_index + 3,
+    ]);
+}
+
+/// Add a waterfall effect - a vertical curtain of water flowing down an edge
+/// This is rendered when water is at an edge with a drop below
+/// drop_height: number of blocks the water falls (1-16 typically)
+pub fn add_waterfall(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    pos: Vec3,
+    tex_layer: u32,
+    face: Face,
+    water_level: u8,
+    drop_height: u8,
+) {
+    if drop_height == 0 {
+        return;
+    }
+
+    let base_index = vertices.len() as u32;
+
+    // Waterfall starts at the water surface and goes down
+    let water_height = (water_level as f32 / 16.0) * 0.9375 + 0.0625;
+    let fall_distance = drop_height as f32;
+
+    // Slight inset to prevent z-fighting with blocks
+    let inset = 0.02;
+
+    let normal = match face {
+        Face::Left => [-1.0, 0.0, 0.0],
+        Face::Right => [1.0, 0.0, 0.0],
+        Face::Front => [0.0, 0.0, 1.0],
+        Face::Back => [0.0, 0.0, -1.0],
+        _ => return, // Only for side faces
+    };
+
+    // Create a vertical quad for the waterfall
+    // UV.y will be used for animated scrolling in shader (0 at top, increases downward)
+    let (positions, uvs) = match face {
+        Face::Left => (
+            [
+                [pos.x + inset, pos.y + water_height - fall_distance, pos.z],
+                [pos.x + inset, pos.y + water_height - fall_distance, pos.z + 1.0],
+                [pos.x + inset, pos.y + water_height, pos.z + 1.0],
+                [pos.x + inset, pos.y + water_height, pos.z],
+            ],
+            [[0.0, fall_distance], [1.0, fall_distance], [1.0, 0.0], [0.0, 0.0]],
+        ),
+        Face::Right => (
+            [
+                [pos.x + 1.0 - inset, pos.y + water_height - fall_distance, pos.z + 1.0],
+                [pos.x + 1.0 - inset, pos.y + water_height - fall_distance, pos.z],
+                [pos.x + 1.0 - inset, pos.y + water_height, pos.z],
+                [pos.x + 1.0 - inset, pos.y + water_height, pos.z + 1.0],
+            ],
+            [[0.0, fall_distance], [1.0, fall_distance], [1.0, 0.0], [0.0, 0.0]],
+        ),
+        Face::Front => (
+            [
+                [pos.x + 1.0, pos.y + water_height - fall_distance, pos.z + 1.0 - inset],
+                [pos.x, pos.y + water_height - fall_distance, pos.z + 1.0 - inset],
+                [pos.x, pos.y + water_height, pos.z + 1.0 - inset],
+                [pos.x + 1.0, pos.y + water_height, pos.z + 1.0 - inset],
+            ],
+            [[0.0, fall_distance], [1.0, fall_distance], [1.0, 0.0], [0.0, 0.0]],
+        ),
+        Face::Back => (
+            [
+                [pos.x, pos.y + water_height - fall_distance, pos.z + inset],
+                [pos.x + 1.0, pos.y + water_height - fall_distance, pos.z + inset],
+                [pos.x + 1.0, pos.y + water_height, pos.z + inset],
+                [pos.x, pos.y + water_height, pos.z + inset],
+            ],
+            [[0.0, fall_distance], [1.0, fall_distance], [1.0, 0.0], [0.0, 0.0]],
+        ),
+        _ => return,
+    };
+
+    // Use negative AO value to signal waterfall to shader (will be clamped but we can detect it)
+    // Actually, let's use a special encoding: ao > 1.0 means waterfall
+    // ao = 1.0 + (fall_distance / 16.0) for waterfalls
+    let ao_waterfall = 1.0 + (fall_distance / 16.0);
+
+    for i in 0..4 {
+        vertices.push(Vertex {
+            position: positions[i],
+            uv: uvs[i],
+            normal,
+            tex_layer,
+            ao: ao_waterfall,
+        });
+    }
+
+    indices.extend_from_slice(&[
+        base_index,
+        base_index + 1,
+        base_index + 2,
+        base_index,
+        base_index + 2,
+        base_index + 3,
+    ]);
+}
