@@ -4,8 +4,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::camera::Frustum;
 use crate::config::{CompiledBiome, CompiledBiomesConfig, TerrainConfig};
+use crate::fluid::MAX_WATER_LEVEL;
 use crate::texture::BlockTextureArray;
-use crate::voxel::{BlockType, Chunk, ChunkNeighbors, NeighborBoundaries, Vertex, CHUNK_SIZE};
+use crate::voxel::{add_water_face, add_water_side_face, BlockType, Chunk, ChunkNeighbors, Face, NeighborBoundaries, Vertex, CHUNK_SIZE};
 use glam::Vec3;
 
 // ============================================================================
@@ -1666,7 +1667,19 @@ impl World {
         frustum: &Frustum,
     ) -> (&[Vertex], &[u32], &[Vertex], &[u32]) {
         self.update_dirty_meshes(texture_indices);
-        self.collect_world_mesh_with_water(texture_indices, frustum)
+        self.collect_world_mesh_with_water(texture_indices, frustum, None)
+    }
+
+    /// Generate mesh for world including separate water mesh with fluid level support
+    /// Returns (terrain_vertices, terrain_indices, water_vertices, water_indices)
+    pub fn generate_world_mesh_with_fluids(
+        &mut self,
+        texture_indices: &BlockTextureArray,
+        frustum: &Frustum,
+        fluid_sim: &crate::fluid::FluidSimulator,
+    ) -> (&[Vertex], &[u32], &[Vertex], &[u32]) {
+        self.update_dirty_meshes(texture_indices);
+        self.collect_world_mesh_with_water(texture_indices, frustum, Some(fluid_sim))
     }
 
     /// Collect meshes from all chunks, separating water from terrain
@@ -1675,9 +1688,8 @@ impl World {
         &mut self,
         texture_indices: &BlockTextureArray,
         frustum: &Frustum,
+        fluid_sim: Option<&crate::fluid::FluidSimulator>,
     ) -> (&[Vertex], &[u32], &[Vertex], &[u32]) {
-        use crate::voxel::{add_subdivided_water_face, Face};
-
         // Clear pre-allocated buffers
         self.mesh_vertices.clear();
         self.mesh_indices.clear();
@@ -1685,7 +1697,19 @@ impl World {
         self.water_indices.clear();
 
         let water_tex_layer = texture_indices[BlockType::Water.as_index()].top;
-        const WATER_SUBDIVISIONS: usize = 4; // 4x4 grid per water block face
+
+        // Helper to get neighbor water level for blocks we already know are water
+        // If fluid_sim returns 0 for a water block, it's unregistered - treat as full
+        let get_neighbor_water_level = |fluid_sim: Option<&crate::fluid::FluidSimulator>, wx: i32, wy: i32, wz: i32| -> u8 {
+            match fluid_sim {
+                Some(sim) => {
+                    let level = sim.get_water_level(wx, wy, wz);
+                    // If level is 0, the water block isn't registered yet - treat as full
+                    if level == 0 { MAX_WATER_LEVEL } else { level }
+                }
+                None => MAX_WATER_LEVEL,
+            }
+        };
 
         // Collect meshes from visible chunks
         for chunk in self.chunks.values() {
@@ -1742,8 +1766,7 @@ impl World {
                 }
             }
 
-            // Generate subdivided water mesh by scanning chunk for water blocks
-            // Render all faces exposed to air
+            // Generate water mesh by scanning chunk for water blocks
             let chunk_offset = glam::Vec3::new(
                 chunk.position[0] as f32 * CHUNK_SIZE as f32,
                 chunk.position[1] as f32 * CHUNK_SIZE as f32,
@@ -1760,30 +1783,41 @@ impl World {
                             continue;
                         }
 
+                        let world_x = chunk_pos[0] * CHUNK_SIZE as i32 + x as i32;
+                        let world_y = chunk_pos[1] * CHUNK_SIZE as i32 + y as i32;
+                        let world_z = chunk_pos[2] * CHUNK_SIZE as i32 + z as i32;
                         let world_pos = chunk_offset + glam::Vec3::new(x as f32, y as f32, z as f32);
 
-                        // Check each face for air exposure
-                        // Top face (+Y)
+                        // Get water level from fluid simulator (default to MAX_WATER_LEVEL if not tracked)
+                        // If fluid_sim returns 0, the water isn't registered yet - treat as full
+                        let water_level = match fluid_sim {
+                            Some(sim) => {
+                                let level = sim.get_water_level(world_x, world_y, world_z);
+                                if level == 0 { MAX_WATER_LEVEL } else { level }
+                            }
+                            None => MAX_WATER_LEVEL,
+                        };
+
+                        // Top face (+Y) - render if above is air
                         let above = if y < CHUNK_SIZE - 1 {
                             chunk.get_block(x, y + 1, z)
                         } else {
-                            // Check neighbor chunk above
                             self.chunks.get(&(chunk_pos[0], chunk_pos[1] + 1, chunk_pos[2]))
                                 .map(|c| c.get_block(x, 0, z))
                                 .unwrap_or(BlockType::Air)
                         };
                         if above == BlockType::Air {
-                            add_subdivided_water_face(
+                            add_water_face(
                                 &mut self.water_vertices,
                                 &mut self.water_indices,
                                 world_pos,
                                 water_tex_layer,
                                 Face::Top,
-                                WATER_SUBDIVISIONS,
+                                water_level,
                             );
                         }
 
-                        // Bottom face (-Y)
+                        // Bottom face (-Y) - render if below is air
                         let below = if y > 0 {
                             chunk.get_block(x, y - 1, z)
                         } else {
@@ -1792,13 +1826,13 @@ impl World {
                                 .unwrap_or(BlockType::Air)
                         };
                         if below == BlockType::Air {
-                            add_subdivided_water_face(
+                            add_water_face(
                                 &mut self.water_vertices,
                                 &mut self.water_indices,
                                 world_pos,
                                 water_tex_layer,
                                 Face::Bottom,
-                                WATER_SUBDIVISIONS,
+                                water_level,
                             );
                         }
 
@@ -1811,14 +1845,28 @@ impl World {
                                 .unwrap_or(BlockType::Air)
                         };
                         if front == BlockType::Air {
-                            add_subdivided_water_face(
+                            add_water_face(
                                 &mut self.water_vertices,
                                 &mut self.water_indices,
                                 world_pos,
                                 water_tex_layer,
                                 Face::Front,
-                                WATER_SUBDIVISIONS,
+                                water_level,
                             );
+                        } else if front == BlockType::Water {
+                            // Check if neighbor water has lower level - render exposed strip
+                            let neighbor_level = get_neighbor_water_level(fluid_sim, world_x, world_y, world_z + 1);
+                            if neighbor_level < water_level {
+                                add_water_side_face(
+                                    &mut self.water_vertices,
+                                    &mut self.water_indices,
+                                    world_pos,
+                                    water_tex_layer,
+                                    Face::Front,
+                                    water_level,
+                                    neighbor_level,
+                                );
+                            }
                         }
 
                         // Back face (-Z)
@@ -1830,14 +1878,27 @@ impl World {
                                 .unwrap_or(BlockType::Air)
                         };
                         if back == BlockType::Air {
-                            add_subdivided_water_face(
+                            add_water_face(
                                 &mut self.water_vertices,
                                 &mut self.water_indices,
                                 world_pos,
                                 water_tex_layer,
                                 Face::Back,
-                                WATER_SUBDIVISIONS,
+                                water_level,
                             );
+                        } else if back == BlockType::Water {
+                            let neighbor_level = get_neighbor_water_level(fluid_sim, world_x, world_y, world_z - 1);
+                            if neighbor_level < water_level {
+                                add_water_side_face(
+                                    &mut self.water_vertices,
+                                    &mut self.water_indices,
+                                    world_pos,
+                                    water_tex_layer,
+                                    Face::Back,
+                                    water_level,
+                                    neighbor_level,
+                                );
+                            }
                         }
 
                         // Right face (+X)
@@ -1849,14 +1910,27 @@ impl World {
                                 .unwrap_or(BlockType::Air)
                         };
                         if right == BlockType::Air {
-                            add_subdivided_water_face(
+                            add_water_face(
                                 &mut self.water_vertices,
                                 &mut self.water_indices,
                                 world_pos,
                                 water_tex_layer,
                                 Face::Right,
-                                WATER_SUBDIVISIONS,
+                                water_level,
                             );
+                        } else if right == BlockType::Water {
+                            let neighbor_level = get_neighbor_water_level(fluid_sim, world_x + 1, world_y, world_z);
+                            if neighbor_level < water_level {
+                                add_water_side_face(
+                                    &mut self.water_vertices,
+                                    &mut self.water_indices,
+                                    world_pos,
+                                    water_tex_layer,
+                                    Face::Right,
+                                    water_level,
+                                    neighbor_level,
+                                );
+                            }
                         }
 
                         // Left face (-X)
@@ -1868,14 +1942,27 @@ impl World {
                                 .unwrap_or(BlockType::Air)
                         };
                         if left == BlockType::Air {
-                            add_subdivided_water_face(
+                            add_water_face(
                                 &mut self.water_vertices,
                                 &mut self.water_indices,
                                 world_pos,
                                 water_tex_layer,
                                 Face::Left,
-                                WATER_SUBDIVISIONS,
+                                water_level,
                             );
+                        } else if left == BlockType::Water {
+                            let neighbor_level = get_neighbor_water_level(fluid_sim, world_x - 1, world_y, world_z);
+                            if neighbor_level < water_level {
+                                add_water_side_face(
+                                    &mut self.water_vertices,
+                                    &mut self.water_indices,
+                                    world_pos,
+                                    water_tex_layer,
+                                    Face::Left,
+                                    water_level,
+                                    neighbor_level,
+                                );
+                            }
                         }
                     }
                 }

@@ -1590,18 +1590,23 @@ fn add_greedy_face(
     ]);
 }
 
-/// Add a subdivided water face with more vertices for smooth wave displacement
-/// subdivisions: number of subdivisions per axis (e.g., 4 means 4x4 = 16 quads per face)
-pub fn add_subdivided_water_face(
+/// Add a simple water face with 4 vertices (no subdivision)
+/// water_level: 1-16, where 16 is a full block
+pub fn add_water_face(
     vertices: &mut Vec<Vertex>,
     indices: &mut Vec<u32>,
     pos: Vec3,
     tex_layer: u32,
     face: Face,
-    subdivisions: usize,
+    water_level: u8,
 ) {
     let base_index = vertices.len() as u32;
-    let step = 1.0 / subdivisions as f32;
+
+    // Water height as fraction of block (level 16 = 1.0, level 1 = 0.0625)
+    let height_fraction = water_level as f32 / 16.0;
+    // Slightly lower the top surface to avoid z-fighting with full blocks
+    let top_height = height_fraction * 0.9375 + 0.0625; // Range: ~0.12 to 1.0
+
     let normal = match face {
         Face::Top => [0.0, 1.0, 0.0],
         Face::Bottom => [0.0, -1.0, 0.0],
@@ -1611,125 +1616,170 @@ pub fn add_subdivided_water_face(
         Face::Back => [0.0, 0.0, -1.0],
     };
 
-    // Generate grid of vertices
-    let grid_size = subdivisions + 1;
+    let (positions, uvs) = match face {
+        Face::Top => (
+            [
+                [pos.x, pos.y + top_height, pos.z],
+                [pos.x, pos.y + top_height, pos.z + 1.0],
+                [pos.x + 1.0, pos.y + top_height, pos.z + 1.0],
+                [pos.x + 1.0, pos.y + top_height, pos.z],
+            ],
+            [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]],
+        ),
+        Face::Bottom => (
+            [
+                [pos.x, pos.y, pos.z + 1.0],
+                [pos.x, pos.y, pos.z],
+                [pos.x + 1.0, pos.y, pos.z],
+                [pos.x + 1.0, pos.y, pos.z + 1.0],
+            ],
+            [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]],
+        ),
+        Face::Left => (
+            [
+                [pos.x, pos.y, pos.z],
+                [pos.x, pos.y, pos.z + 1.0],
+                [pos.x, pos.y + top_height, pos.z + 1.0],
+                [pos.x, pos.y + top_height, pos.z],
+            ],
+            [[1.0, 1.0], [0.0, 1.0], [0.0, 1.0 - height_fraction], [1.0, 1.0 - height_fraction]],
+        ),
+        Face::Right => (
+            [
+                [pos.x + 1.0, pos.y, pos.z + 1.0],
+                [pos.x + 1.0, pos.y, pos.z],
+                [pos.x + 1.0, pos.y + top_height, pos.z],
+                [pos.x + 1.0, pos.y + top_height, pos.z + 1.0],
+            ],
+            [[1.0, 1.0], [0.0, 1.0], [0.0, 1.0 - height_fraction], [1.0, 1.0 - height_fraction]],
+        ),
+        Face::Front => (
+            [
+                [pos.x, pos.y, pos.z + 1.0],
+                [pos.x + 1.0, pos.y, pos.z + 1.0],
+                [pos.x + 1.0, pos.y + top_height, pos.z + 1.0],
+                [pos.x, pos.y + top_height, pos.z + 1.0],
+            ],
+            [[0.0, 1.0], [1.0, 1.0], [1.0, 1.0 - height_fraction], [0.0, 1.0 - height_fraction]],
+        ),
+        Face::Back => (
+            [
+                [pos.x + 1.0, pos.y, pos.z],
+                [pos.x, pos.y, pos.z],
+                [pos.x, pos.y + top_height, pos.z],
+                [pos.x + 1.0, pos.y + top_height, pos.z],
+            ],
+            [[0.0, 1.0], [1.0, 1.0], [1.0, 1.0 - height_fraction], [0.0, 1.0 - height_fraction]],
+        ),
+    };
 
-    match face {
-        Face::Top => {
-            // Top face: Y is constant at pos.y + 1, grid on X-Z plane
-            for row in 0..grid_size {
-                for col in 0..grid_size {
-                    let u = col as f32 * step;
-                    let v = row as f32 * step;
-                    vertices.push(Vertex {
-                        position: [pos.x + u, pos.y + 1.0, pos.z + v],
-                        uv: [u, v],
-                        normal,
-                        tex_layer,
-                        ao: 1.0, // No AO for water
-                    });
-                }
-            }
-        }
-        Face::Bottom => {
-            // Bottom face: Y is constant at pos.y, grid on X-Z plane
-            for row in 0..grid_size {
-                for col in 0..grid_size {
-                    let u = col as f32 * step;
-                    let v = row as f32 * step;
-                    vertices.push(Vertex {
-                        position: [pos.x + u, pos.y, pos.z + v],
-                        uv: [u, v],
-                        normal,
-                        tex_layer,
-                        ao: 1.0,
-                    });
-                }
-            }
-        }
-        _ => {
-            // For side faces, we don't need subdivision as much
-            // Just add a simple quad
-            let (positions, uvs) = match face {
-                Face::Left => (
-                    [
-                        [pos.x, pos.y, pos.z],
-                        [pos.x, pos.y, pos.z + 1.0],
-                        [pos.x, pos.y + 1.0, pos.z + 1.0],
-                        [pos.x, pos.y + 1.0, pos.z],
-                    ],
-                    [[1.0, 1.0], [0.0, 1.0], [0.0, 0.0], [1.0, 0.0]],
-                ),
-                Face::Right => (
-                    [
-                        [pos.x + 1.0, pos.y, pos.z + 1.0],
-                        [pos.x + 1.0, pos.y, pos.z],
-                        [pos.x + 1.0, pos.y + 1.0, pos.z],
-                        [pos.x + 1.0, pos.y + 1.0, pos.z + 1.0],
-                    ],
-                    [[1.0, 1.0], [0.0, 1.0], [0.0, 0.0], [1.0, 0.0]],
-                ),
-                Face::Front => (
-                    [
-                        [pos.x, pos.y, pos.z + 1.0],
-                        [pos.x + 1.0, pos.y, pos.z + 1.0],
-                        [pos.x + 1.0, pos.y + 1.0, pos.z + 1.0],
-                        [pos.x, pos.y + 1.0, pos.z + 1.0],
-                    ],
-                    [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
-                ),
-                Face::Back => (
-                    [
-                        [pos.x + 1.0, pos.y, pos.z],
-                        [pos.x, pos.y, pos.z],
-                        [pos.x, pos.y + 1.0, pos.z],
-                        [pos.x + 1.0, pos.y + 1.0, pos.z],
-                    ],
-                    [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
-                ),
-                _ => unreachable!(),
-            };
-
-            for i in 0..4 {
-                vertices.push(Vertex {
-                    position: positions[i],
-                    uv: uvs[i],
-                    normal,
-                    tex_layer,
-                    ao: 1.0,
-                });
-            }
-
-            // Simple quad indices
-            indices.extend_from_slice(&[
-                base_index,
-                base_index + 1,
-                base_index + 2,
-                base_index,
-                base_index + 2,
-                base_index + 3,
-            ]);
-            return;
-        }
+    for i in 0..4 {
+        vertices.push(Vertex {
+            position: positions[i],
+            uv: uvs[i],
+            normal,
+            tex_layer,
+            ao: height_fraction, // Encode water level for shader
+        });
     }
 
-    // Generate indices for the subdivided grid (Top and Bottom faces)
-    for row in 0..subdivisions {
-        for col in 0..subdivisions {
-            let top_left = base_index + (row * grid_size + col) as u32;
-            let top_right = top_left + 1;
-            let bottom_left = top_left + grid_size as u32;
-            let bottom_right = bottom_left + 1;
+    indices.extend_from_slice(&[
+        base_index,
+        base_index + 1,
+        base_index + 2,
+        base_index,
+        base_index + 2,
+        base_index + 3,
+    ]);
+}
 
-            // Two triangles per cell
-            indices.extend_from_slice(&[
-                top_left,
-                bottom_left,
-                bottom_right,
-                top_left,
-                bottom_right,
-                top_right,
-            ]);
-        }
+/// Add a water side face that shows the exposed portion between two different water levels
+/// This renders only the strip of water visible above the adjacent water block
+/// our_level: this block's water level (1-16)
+/// neighbor_level: adjacent block's water level (1-16, must be less than our_level)
+pub fn add_water_side_face(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    pos: Vec3,
+    tex_layer: u32,
+    face: Face,
+    our_level: u8,
+    neighbor_level: u8,
+) {
+    let base_index = vertices.len() as u32;
+
+    // Heights as fractions
+    let our_height = (our_level as f32 / 16.0) * 0.9375 + 0.0625;
+    let neighbor_height = (neighbor_level as f32 / 16.0) * 0.9375 + 0.0625;
+
+    let normal = match face {
+        Face::Left => [-1.0, 0.0, 0.0],
+        Face::Right => [1.0, 0.0, 0.0],
+        Face::Front => [0.0, 0.0, 1.0],
+        Face::Back => [0.0, 0.0, -1.0],
+        _ => return, // Only for side faces
+    };
+
+    // UV fraction for the visible strip
+    let our_frac = our_level as f32 / 16.0;
+    let neighbor_frac = neighbor_level as f32 / 16.0;
+
+    let (positions, uvs) = match face {
+        Face::Left => (
+            [
+                [pos.x, pos.y + neighbor_height, pos.z],
+                [pos.x, pos.y + neighbor_height, pos.z + 1.0],
+                [pos.x, pos.y + our_height, pos.z + 1.0],
+                [pos.x, pos.y + our_height, pos.z],
+            ],
+            [[1.0, 1.0 - neighbor_frac], [0.0, 1.0 - neighbor_frac], [0.0, 1.0 - our_frac], [1.0, 1.0 - our_frac]],
+        ),
+        Face::Right => (
+            [
+                [pos.x + 1.0, pos.y + neighbor_height, pos.z + 1.0],
+                [pos.x + 1.0, pos.y + neighbor_height, pos.z],
+                [pos.x + 1.0, pos.y + our_height, pos.z],
+                [pos.x + 1.0, pos.y + our_height, pos.z + 1.0],
+            ],
+            [[1.0, 1.0 - neighbor_frac], [0.0, 1.0 - neighbor_frac], [0.0, 1.0 - our_frac], [1.0, 1.0 - our_frac]],
+        ),
+        Face::Front => (
+            [
+                [pos.x, pos.y + neighbor_height, pos.z + 1.0],
+                [pos.x + 1.0, pos.y + neighbor_height, pos.z + 1.0],
+                [pos.x + 1.0, pos.y + our_height, pos.z + 1.0],
+                [pos.x, pos.y + our_height, pos.z + 1.0],
+            ],
+            [[0.0, 1.0 - neighbor_frac], [1.0, 1.0 - neighbor_frac], [1.0, 1.0 - our_frac], [0.0, 1.0 - our_frac]],
+        ),
+        Face::Back => (
+            [
+                [pos.x + 1.0, pos.y + neighbor_height, pos.z],
+                [pos.x, pos.y + neighbor_height, pos.z],
+                [pos.x, pos.y + our_height, pos.z],
+                [pos.x + 1.0, pos.y + our_height, pos.z],
+            ],
+            [[0.0, 1.0 - neighbor_frac], [1.0, 1.0 - neighbor_frac], [1.0, 1.0 - our_frac], [0.0, 1.0 - our_frac]],
+        ),
+        _ => return,
+    };
+
+    for i in 0..4 {
+        vertices.push(Vertex {
+            position: positions[i],
+            uv: uvs[i],
+            normal,
+            tex_layer,
+            ao: our_level as f32 / 16.0,
+        });
     }
+
+    indices.extend_from_slice(&[
+        base_index,
+        base_index + 1,
+        base_index + 2,
+        base_index,
+        base_index + 2,
+        base_index + 3,
+    ]);
 }

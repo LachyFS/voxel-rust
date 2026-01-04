@@ -2,6 +2,7 @@ mod camera;
 mod config;
 #[cfg(feature = "embed-assets")]
 mod embedded_assets;
+mod fluid;
 mod raycast;
 mod renderer;
 mod texture;
@@ -33,6 +34,7 @@ struct App {
     camera_controller: CameraController,
     world: Option<World>,
     texture_manager: Option<TextureManager>,
+    fluid_simulator: fluid::FluidSimulator,
     config: Config,
     last_frame: Instant,
     // FPS tracking
@@ -80,6 +82,7 @@ impl App {
             ),
             world: None,
             texture_manager,
+            fluid_simulator: fluid::FluidSimulator::new(),
             config,
             last_frame: Instant::now(),
             frame_count: 0,
@@ -210,6 +213,9 @@ impl ApplicationHandler for App {
                                     let pos = hit.block_pos;
                                     if world.destroy_block(pos[0], pos[1], pos[2]).is_some() {
                                         log::debug!("Destroyed block at {:?}", pos);
+                                        // Notify fluid simulator to activate adjacent water
+                                        // This also registers any worldgen water that wasn't yet in the fluid system
+                                        self.fluid_simulator.on_block_destroyed_with_world(pos[0], pos[1], pos[2], world);
                                     }
                                 }
                             }
@@ -276,6 +282,9 @@ impl ApplicationHandler for App {
                     if let Some(world) = &mut self.world {
                         let _chunks_changed = world.update_for_position(camera.position.x, camera.position.z);
 
+                        // Update fluid simulation
+                        self.fluid_simulator.update_with_world(dt, world);
+
                         // Perform raycast for block selection
                         let direction = get_camera_direction(camera.yaw, camera.pitch);
                         self.current_selection = raycast(world, camera.position, direction, 10.0);
@@ -287,9 +296,10 @@ impl ApplicationHandler for App {
 
                         // Rebuild mesh if chunks changed (always use current frustum for culling)
                         // Also update every frame for frustum culling when camera rotates
+                        // Pass fluid simulator for water level rendering
                         if let Some(renderer) = &mut self.renderer {
                             let frustum = camera.frustum();
-                            renderer.update_world(world, &frustum);
+                            renderer.update_world_with_fluids(world, &frustum, Some(&self.fluid_simulator));
                         }
                     }
                 }

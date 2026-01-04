@@ -1297,10 +1297,23 @@ impl Renderer {
     /// Update mesh from entire world with neighbor-aware culling and frustum culling
     /// Uses double-buffering to avoid GPU contention
     pub fn update_world(&mut self, world: &mut World, frustum: &Frustum) {
+        self.update_world_with_fluids(world, frustum, None);
+    }
+
+    /// Update mesh from entire world with fluid level support
+    /// Uses double-buffering to avoid GPU contention
+    pub fn update_world_with_fluids(
+        &mut self,
+        world: &mut World,
+        frustum: &Frustum,
+        fluid_sim: Option<&crate::fluid::FluidSimulator>,
+    ) {
         // Use World's mesh generation which handles neighbor culling and frustum culling
         // Returns slices into pre-allocated buffers (no allocation)
-        let (all_vertices, all_indices, water_vertices, water_indices) =
-            world.generate_world_mesh_with_water(&self.block_textures, frustum);
+        let (all_vertices, all_indices, water_vertices, water_indices) = match fluid_sim {
+            Some(sim) => world.generate_world_mesh_with_fluids(&self.block_textures, frustum, sim),
+            None => world.generate_world_mesh_with_water(&self.block_textures, frustum),
+        };
 
         let write_buffer = 1 - self.current_buffer;
 
