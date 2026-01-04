@@ -370,6 +370,16 @@ impl FluidSimulator {
         self.pending_activations.push((world_x, world_y, world_z));
     }
 
+    /// Queue activation of a block AND all its cardinal neighbors
+    /// This helps propagate pressure changes further through water bodies
+    fn queue_activation_with_neighbors(&mut self, world_x: i32, world_y: i32, world_z: i32) {
+        self.pending_activations.push((world_x, world_y, world_z));
+        self.pending_activations.push((world_x + 1, world_y, world_z));
+        self.pending_activations.push((world_x - 1, world_y, world_z));
+        self.pending_activations.push((world_x, world_y, world_z + 1));
+        self.pending_activations.push((world_x, world_y, world_z - 1));
+    }
+
     /// Check if a position is part of a large water body (ocean)
     /// Uses cached results when available, otherwise does a limited flood-fill
     fn is_ocean_block(&mut self, x: i32, y: i32, z: i32, world: &World) -> bool {
@@ -715,31 +725,19 @@ impl FluidSimulator {
         }
 
         // Priority 2: Equalize with ALL cardinal neighbors (true pressure equalization)
-        // Include neighbors at equal or lower levels to properly spread water
+        // This creates proper water leveling across entire bodies
         if current_level > 0 {
-            // Only use cardinal neighbors (first 4) for equalization to avoid over-spreading
+            // Only use cardinal neighbors (first 4) for equalization
             let cardinal_neighbors: Vec<_> = neighbors.iter()
-                .take(4)  // Only cardinal directions, not diagonals
+                .take(4)
                 .filter(|n| n.can_flow)
                 .collect();
 
             if !cardinal_neighbors.is_empty() {
-                // Calculate what a fully equalized state would look like
-                let total_water: u16 = current_level as u16 + cardinal_neighbors.iter().map(|n| n.level as u16).sum::<u16>();
-                let num_blocks = 1 + cardinal_neighbors.len() as u16;
-                let avg_level = (total_water / num_blocks) as u8;
-                let remainder = (total_water % num_blocks) as u8;
-
-                // Check if we're already equalized (all within 1 of each other)
-                let min_level = cardinal_neighbors.iter().map(|n| n.level).min().unwrap_or(current_level);
-                let max_level = cardinal_neighbors.iter().map(|n| n.level).max().unwrap_or(current_level);
-                let our_min_max = current_level.min(min_level);
-                let our_max_max = current_level.max(max_level);
-
-                // If difference is <= 1, we're equalized
-                if our_max_max - our_min_max <= 1 {
-                    return; // Already equalized, nothing to do
-                }
+                // Find the minimum level among all connected blocks (including self)
+                let min_neighbor = cardinal_neighbors.iter().map(|n| n.level).min().unwrap_or(current_level);
+                let min_level = current_level.min(min_neighbor);
+                let max_level = current_level.max(cardinal_neighbors.iter().map(|n| n.level).max().unwrap_or(current_level));
 
                 // Ocean blocks don't lose water when spreading horizontally
                 if is_ocean {
@@ -749,7 +747,7 @@ impl FluidSimulator {
                             let target = current_level.min(MAX_WATER_LEVEL);
                             if target != neighbor.level {
                                 self.queue_water_update(neighbor.pos.0, neighbor.pos.1, neighbor.pos.2, target);
-                                self.queue_activation(neighbor.pos.0, neighbor.pos.1, neighbor.pos.2);
+                                self.queue_activation_with_neighbors(neighbor.pos.0, neighbor.pos.1, neighbor.pos.2);
                                 log::debug!("Water OCEAN SPREAD ({},{},{})->({},{},{}): {} -> {} (infinite)",
                                            x, y, z, neighbor.pos.0, neighbor.pos.1, neighbor.pos.2, neighbor.level, target);
                             }
@@ -759,10 +757,20 @@ impl FluidSimulator {
                     return;
                 }
 
-                log::debug!("Water EQUALIZE ({},{},{}): total={}, blocks={}, avg={}, remainder={}, range=[{},{}]",
-                           x, y, z, total_water, num_blocks, avg_level, remainder, our_min_max, our_max_max);
+                // If all blocks are at exactly the same level, we're done
+                if max_level == min_level {
+                    return;
+                }
 
-                // Distribute water - blocks sorted by current level get remainder first (keeps more water in higher blocks)
+                // Calculate equalized levels
+                let total_water: u16 = current_level as u16 + cardinal_neighbors.iter().map(|n| n.level as u16).sum::<u16>();
+                let num_blocks = 1 + cardinal_neighbors.len() as u16;
+                let avg_level = (total_water / num_blocks) as u8;
+                let remainder = (total_water % num_blocks) as u8;
+
+                log::debug!("Water EQUALIZE ({},{},{}): total={}, blocks={}, avg={}, remainder={}, range=[{},{}]",
+                           x, y, z, total_water, num_blocks, avg_level, remainder, min_level, max_level);
+
                 // Build list of all blocks with their current levels
                 let mut all_blocks: Vec<((i32, i32, i32), u8)> = vec![((x, y, z), current_level)];
                 for n in &cardinal_neighbors {
@@ -771,18 +779,29 @@ impl FluidSimulator {
                 // Sort by level descending so higher blocks get remainder
                 all_blocks.sort_by_key(|(_, level)| std::cmp::Reverse(*level));
 
-                // Distribute water
+                // Distribute water and propagate activation to neighbors
+                let mut any_changed = false;
                 for (i, (pos, old_level)) in all_blocks.iter().enumerate() {
                     let target_level = if (i as u8) < remainder { avg_level + 1 } else { avg_level };
                     if target_level != *old_level {
+                        any_changed = true;
                         self.queue_water_update(pos.0, pos.1, pos.2, target_level);
-                        self.queue_activation(pos.0, pos.1, pos.2);
+                        // Use activation with neighbors to propagate pressure through the water body
+                        self.queue_activation_with_neighbors(pos.0, pos.1, pos.2);
                         if *pos == (x, y, z) {
                             log::debug!("Water SELF ({},{},{}): {} -> {}", x, y, z, old_level, target_level);
                         } else {
                             log::debug!("Water SPREAD ({},{},{})->({},{},{}): {} -> {}",
                                        x, y, z, pos.0, pos.1, pos.2, old_level, target_level);
                         }
+                    }
+                }
+
+                // If levels changed, also activate neighbors of unchanged blocks
+                // This helps propagate the pressure wave further
+                if any_changed {
+                    for n in &cardinal_neighbors {
+                        self.queue_activation_with_neighbors(n.pos.0, n.pos.1, n.pos.2);
                     }
                 }
             }
