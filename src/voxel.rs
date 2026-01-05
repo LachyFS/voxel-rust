@@ -1918,8 +1918,9 @@ pub fn add_waterfall(
     let water_height = (water_level as f32 / 16.0) * 0.9375 + 0.0625;
     let fall_distance = drop_height as f32;
 
-    // Slight inset to prevent z-fighting with blocks
-    let inset = 0.02;
+    // Small offset outward from the water block edge to prevent z-fighting
+    // The waterfall hangs from the edge of the water block, extending downward
+    let offset = 0.01;
 
     let normal = match face {
         Face::Left => [-1.0, 0.0, 0.0],
@@ -1930,41 +1931,47 @@ pub fn add_waterfall(
     };
 
     // Create a vertical quad for the waterfall
+    // The waterfall hangs from the edge of the water block, going downward
+    // Position it slightly outward from the block edge to be visible
     // UV.y will be used for animated scrolling in shader (0 at top, increases downward)
     let (positions, uvs) = match face {
+        // Left face (-X): waterfall hangs from left edge of water block
         Face::Left => (
             [
-                [pos.x + inset, pos.y + water_height - fall_distance, pos.z],
-                [pos.x + inset, pos.y + water_height - fall_distance, pos.z + 1.0],
-                [pos.x + inset, pos.y + water_height, pos.z + 1.0],
-                [pos.x + inset, pos.y + water_height, pos.z],
+                [pos.x - offset, pos.y + water_height - fall_distance, pos.z],
+                [pos.x - offset, pos.y + water_height - fall_distance, pos.z + 1.0],
+                [pos.x - offset, pos.y + water_height, pos.z + 1.0],
+                [pos.x - offset, pos.y + water_height, pos.z],
             ],
             [[0.0, fall_distance], [1.0, fall_distance], [1.0, 0.0], [0.0, 0.0]],
         ),
+        // Right face (+X): waterfall hangs from right edge of water block
         Face::Right => (
             [
-                [pos.x + 1.0 - inset, pos.y + water_height - fall_distance, pos.z + 1.0],
-                [pos.x + 1.0 - inset, pos.y + water_height - fall_distance, pos.z],
-                [pos.x + 1.0 - inset, pos.y + water_height, pos.z],
-                [pos.x + 1.0 - inset, pos.y + water_height, pos.z + 1.0],
+                [pos.x + 1.0 + offset, pos.y + water_height - fall_distance, pos.z + 1.0],
+                [pos.x + 1.0 + offset, pos.y + water_height - fall_distance, pos.z],
+                [pos.x + 1.0 + offset, pos.y + water_height, pos.z],
+                [pos.x + 1.0 + offset, pos.y + water_height, pos.z + 1.0],
             ],
             [[0.0, fall_distance], [1.0, fall_distance], [1.0, 0.0], [0.0, 0.0]],
         ),
+        // Front face (+Z): waterfall hangs from front edge of water block
         Face::Front => (
             [
-                [pos.x + 1.0, pos.y + water_height - fall_distance, pos.z + 1.0 - inset],
-                [pos.x, pos.y + water_height - fall_distance, pos.z + 1.0 - inset],
-                [pos.x, pos.y + water_height, pos.z + 1.0 - inset],
-                [pos.x + 1.0, pos.y + water_height, pos.z + 1.0 - inset],
+                [pos.x + 1.0, pos.y + water_height - fall_distance, pos.z + 1.0 + offset],
+                [pos.x, pos.y + water_height - fall_distance, pos.z + 1.0 + offset],
+                [pos.x, pos.y + water_height, pos.z + 1.0 + offset],
+                [pos.x + 1.0, pos.y + water_height, pos.z + 1.0 + offset],
             ],
             [[0.0, fall_distance], [1.0, fall_distance], [1.0, 0.0], [0.0, 0.0]],
         ),
+        // Back face (-Z): waterfall hangs from back edge of water block
         Face::Back => (
             [
-                [pos.x, pos.y + water_height - fall_distance, pos.z + inset],
-                [pos.x + 1.0, pos.y + water_height - fall_distance, pos.z + inset],
-                [pos.x + 1.0, pos.y + water_height, pos.z + inset],
-                [pos.x, pos.y + water_height, pos.z + inset],
+                [pos.x, pos.y + water_height - fall_distance, pos.z - offset],
+                [pos.x + 1.0, pos.y + water_height - fall_distance, pos.z - offset],
+                [pos.x + 1.0, pos.y + water_height, pos.z - offset],
+                [pos.x, pos.y + water_height, pos.z - offset],
             ],
             [[0.0, fall_distance], [1.0, fall_distance], [1.0, 0.0], [0.0, 0.0]],
         ),

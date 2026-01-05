@@ -237,9 +237,9 @@ fn specular_highlight(view_dir: vec3<f32>, normal: vec3<f32>, light_dir: vec3<f3
 
 // Waterfall noise pattern
 fn waterfall_noise(uv: vec2<f32>, time: f32) -> f32 {
-    // Animated vertical streaks
+    // Animated vertical streaks - subtract time to scroll downward (with gravity)
     let scroll_speed = 3.0;
-    let scrolled_uv = vec2<f32>(uv.x, uv.y + time * scroll_speed);
+    let scrolled_uv = vec2<f32>(uv.x, uv.y - time * scroll_speed);
 
     // Multiple octaves of noise for detail
     let noise1 = snoise(scrolled_uv * vec2<f32>(2.0, 1.0)) * 0.5;

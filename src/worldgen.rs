@@ -1820,7 +1820,8 @@ impl World {
                             None => MAX_WATER_LEVEL,
                         };
 
-                        // Top face (+Y) - render if above is air
+                        // Top face (+Y) - render if above is air, OR if water level < full and above is solid
+                        // (when water is partial and has a solid block above, there's a gap that needs rendering)
                         let above = if y < CHUNK_SIZE - 1 {
                             chunk.get_block(x, y + 1, z)
                         } else {
@@ -1828,7 +1829,9 @@ impl World {
                                 .map(|c| c.get_block(x, 0, z))
                                 .unwrap_or(BlockType::Air)
                         };
-                        if above == BlockType::Air {
+                        let should_render_top = above == BlockType::Air
+                            || (above != BlockType::Water && water_level < MAX_WATER_LEVEL);
+                        if should_render_top {
                             // Gather neighbor water levels for smooth interpolation
                             let neighbors = WaterNeighborLevels {
                                 neg_x: get_neighbor_water_level(&self.chunks, fluid_sim, world_x - 1, world_y, world_z),

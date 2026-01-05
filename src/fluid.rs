@@ -587,6 +587,7 @@ impl FluidSimulator {
         let can_flow_down = match below_block {
             Some(BlockType::Air) => true,
             Some(BlockType::Water) => below_level < MAX_WATER_LEVEL,
+            Some(block) if block.is_foliage() => true, // Water destroys foliage
             _ => false,
         };
 
@@ -651,18 +652,20 @@ impl FluidSimulator {
             let can_flow = match block {
                 Some(BlockType::Air) => true,
                 Some(BlockType::Water) => true,
+                Some(b) if b.is_foliage() => true, // Water destroys foliage
                 _ => false,
             };
 
             if can_flow {
                 let neighbor_level = self.get_water_level(nx, ny, nz);
 
-                // Check if neighbor has a hole below it (air or non-full water)
+                // Check if neighbor has a hole below it (air, non-full water, or foliage)
                 let below_neighbor = world.get_block(nx, ny - 1, nz);
                 let below_neighbor_level = self.get_water_level(nx, ny - 1, nz);
                 let has_hole_below = match below_neighbor {
                     Some(BlockType::Air) => true,
                     Some(BlockType::Water) => below_neighbor_level < MAX_WATER_LEVEL,
+                    Some(b) if b.is_foliage() => true, // Foliage can be destroyed
                     _ => false,
                 };
 
@@ -919,6 +922,7 @@ impl FluidSimulator {
         let can_flow_down = match below_block {
             Some(BlockType::Air) => true,
             Some(BlockType::Water) => below_level < MAX_WATER_LEVEL,
+            Some(block) if block.is_foliage() => true, // Water destroys foliage
             _ => false,
         };
 
@@ -957,6 +961,7 @@ impl FluidSimulator {
             let can_flow = match block {
                 Some(BlockType::Air) => true,
                 Some(BlockType::Water) => true,
+                Some(b) if b.is_foliage() => true, // Water destroys foliage
                 _ => false,
             };
 
