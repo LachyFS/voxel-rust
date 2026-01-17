@@ -30,7 +30,7 @@ pub struct FluidConfig {
 impl Default for FluidConfig {
     fn default() -> Self {
         Self {
-            tick_rate: 10.0, // 10 ticks per second
+            tick_rate: 4.0, // 4 ticks per second
             max_blocks_per_tick: 10000,
             enabled: true,
         }

@@ -125,7 +125,7 @@ pub fn raycast(
     while t < max_distance {
         // Check if current voxel is solid
         if let Some(block_type) = get_block_at_world_pos(world, pos) {
-            if block_type.is_solid() && !block_type.is_foliage() {
+            if block_type.is_solid() && !block_type.is_foliage() && block_type != BlockType::Water {
                 let hit_point = origin + dir * t;
                 return Some(RaycastHit {
                     block_pos: pos,
