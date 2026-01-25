@@ -3,8 +3,19 @@
 //! Water exists as discrete levels (0-16) that flow downward with gravity
 //! and spread horizontally to equalize pressure. 16 levels provides smooth
 //! gradations while keeping integer arithmetic for efficiency.
+//!
+//! Performance optimizations:
+//! - FxHashMap/FxHashSet for faster hashing (non-cryptographic)
+//! - Bitwise operations for coordinate conversion
+//! - SmallVec for stack-allocated neighbor lists
+//! - Reusable buffers to avoid per-tick allocations
+//! - Adaptive dense/sparse storage based on water density
+//! - Batched activations to reduce push overhead
 
-use std::collections::{HashMap, HashSet};
+use std::collections::VecDeque;
+
+use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 
 use crate::voxel::BlockType;
 use crate::worldgen::{ChunkPos, World};
@@ -15,6 +26,9 @@ pub const MAX_WATER_LEVEL: u8 = 16;
 /// Volume threshold above which a water body is treated as infinite (ocean)
 /// Water blocks in bodies larger than this won't lose water when spreading
 pub const OCEAN_THRESHOLD: usize = 500;
+
+/// Threshold for switching from sparse to dense storage (number of water blocks)
+const DENSE_THRESHOLD: usize = 256;
 
 /// Fluid simulation configuration
 #[derive(Clone)]
@@ -37,17 +51,131 @@ impl Default for FluidConfig {
     }
 }
 
+/// Adaptive water storage - switches between sparse HashMap and dense array
+/// based on water block count to optimize for both sparse and dense scenarios
+#[derive(Clone)]
+pub enum WaterStorage {
+    /// Sparse storage for chunks with few water blocks (< DENSE_THRESHOLD)
+    Sparse(FxHashMap<u16, u8>),
+    /// Dense storage for chunks with many water blocks (>= DENSE_THRESHOLD)
+    /// Uses a fixed 4096-byte array (16³) with 0 meaning no water
+    Dense(Box<[u8; 4096]>),
+}
+
+impl Default for WaterStorage {
+    fn default() -> Self {
+        WaterStorage::Sparse(FxHashMap::default())
+    }
+}
+
+impl WaterStorage {
+    #[inline]
+    pub fn get(&self, packed: u16) -> u8 {
+        match self {
+            WaterStorage::Sparse(map) => map.get(&packed).copied().unwrap_or(0),
+            WaterStorage::Dense(arr) => arr[packed as usize],
+        }
+    }
+
+    #[inline]
+    pub fn set(&mut self, packed: u16, level: u8) {
+        match self {
+            WaterStorage::Sparse(map) => {
+                if level == 0 {
+                    map.remove(&packed);
+                } else {
+                    map.insert(packed, level);
+                }
+            }
+            WaterStorage::Dense(arr) => {
+                arr[packed as usize] = level;
+            }
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            WaterStorage::Sparse(map) => map.len(),
+            WaterStorage::Dense(arr) => arr.iter().filter(|&&l| l > 0).count(),
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        match self {
+            WaterStorage::Sparse(map) => map.is_empty(),
+            WaterStorage::Dense(arr) => !arr.iter().any(|&l| l > 0),
+        }
+    }
+
+    /// Convert to dense storage if we exceed the threshold
+    pub fn maybe_convert_to_dense(&mut self) {
+        if let WaterStorage::Sparse(map) = self {
+            if map.len() >= DENSE_THRESHOLD {
+                let mut arr = Box::new([0u8; 4096]);
+                for (&packed, &level) in map.iter() {
+                    arr[packed as usize] = level;
+                }
+                *self = WaterStorage::Dense(arr);
+            }
+        }
+    }
+
+    /// Convert back to sparse if we drop below threshold (with hysteresis)
+    pub fn maybe_convert_to_sparse(&mut self) {
+        if let WaterStorage::Dense(arr) = self {
+            let count = arr.iter().filter(|&&l| l > 0).count();
+            // Use hysteresis: only convert back at half the threshold
+            if count < DENSE_THRESHOLD / 2 {
+                let mut map = FxHashMap::default();
+                for (i, &level) in arr.iter().enumerate() {
+                    if level > 0 {
+                        map.insert(i as u16, level);
+                    }
+                }
+                *self = WaterStorage::Sparse(map);
+            }
+        }
+    }
+
+    /// Iterate over all water blocks
+    pub fn iter(&self) -> impl Iterator<Item = (u16, u8)> + '_ {
+        let sparse_iter = if let WaterStorage::Sparse(map) = self {
+            Some(map.iter().map(|(&k, &v)| (k, v)))
+        } else {
+            None
+        };
+
+        let dense_iter = if let WaterStorage::Dense(arr) = self {
+            Some(
+                arr.iter()
+                    .enumerate()
+                    .filter(|(_, &l)| l > 0)
+                    .map(|(i, &l)| (i as u16, l)),
+            )
+        } else {
+            None
+        };
+
+        sparse_iter
+            .into_iter()
+            .flatten()
+            .chain(dense_iter.into_iter().flatten())
+    }
+}
+
 /// Fluid state for a single chunk
 #[derive(Default, Clone)]
 pub struct ChunkFluidState {
-    /// Water levels indexed by packed local position
-    /// Key: x + y*16 + z*256 (fits in u16 for 16x16x16 chunk)
-    /// Value: water level 1-16 (0 means no water, use HashMap absence)
-    levels: HashMap<u16, u8>,
+    /// Water levels - adaptive sparse/dense storage
+    levels: WaterStorage,
 
-    /// Blocks that need processing next tick
-    /// Stored as packed local coordinates
-    active: HashSet<u16>,
+    /// Blocks that need processing next tick (packed local coordinates)
+    active: FxHashSet<u16>,
+
+    /// Reusable buffer for draining active blocks (avoids allocation each tick)
+    active_buffer: Vec<u16>,
 
     /// Whether this chunk's fluid state changed this tick
     dirty: bool,
@@ -55,89 +183,101 @@ pub struct ChunkFluidState {
 
 impl ChunkFluidState {
     /// Pack local chunk coordinates into a single u16
+    /// Uses bit packing: x + y*16 + z*256 (12 bits total for 16³ chunk)
     #[inline]
     pub fn pack_coords(x: u8, y: u8, z: u8) -> u16 {
         debug_assert!(x < 16 && y < 16 && z < 16);
-        x as u16 + (y as u16 * 16) + (z as u16 * 256)
+        x as u16 | ((y as u16) << 4) | ((z as u16) << 8)
     }
 
-    /// Unpack a u16 back into local chunk coordinates
+    /// Unpack a u16 back into local chunk coordinates using bitwise ops
     #[inline]
     pub fn unpack_coords(packed: u16) -> (u8, u8, u8) {
-        let x = (packed % 16) as u8;
-        let y = ((packed / 16) % 16) as u8;
-        let z = (packed / 256) as u8;
+        let x = (packed & 0xF) as u8;
+        let y = ((packed >> 4) & 0xF) as u8;
+        let z = ((packed >> 8) & 0xF) as u8;
         (x, y, z)
     }
 
     /// Get water level at local coordinates (0 if no water)
+    #[inline]
     pub fn get_level(&self, x: u8, y: u8, z: u8) -> u8 {
-        self.levels
-            .get(&Self::pack_coords(x, y, z))
-            .copied()
-            .unwrap_or(0)
+        self.levels.get(Self::pack_coords(x, y, z))
     }
 
     /// Set water level at local coordinates
     /// Level 0 removes the water entry
     pub fn set_level(&mut self, x: u8, y: u8, z: u8, level: u8) {
         let key = Self::pack_coords(x, y, z);
-        if level == 0 {
-            self.levels.remove(&key);
-        } else {
-            self.levels.insert(key, level.min(MAX_WATER_LEVEL));
-        }
+        self.levels.set(key, level.min(MAX_WATER_LEVEL));
         self.dirty = true;
+
+        // Check if we need to convert storage type
+        if level > 0 {
+            self.levels.maybe_convert_to_dense();
+        } else {
+            self.levels.maybe_convert_to_sparse();
+        }
     }
 
     /// Mark a block as needing simulation next tick
+    #[inline]
     pub fn mark_active(&mut self, x: u8, y: u8, z: u8) {
         self.active.insert(Self::pack_coords(x, y, z));
     }
 
     /// Check if a block is marked active
+    #[inline]
     pub fn is_active(&self, x: u8, y: u8, z: u8) -> bool {
         self.active.contains(&Self::pack_coords(x, y, z))
     }
 
-    /// Take all active blocks (drains the set)
-    pub fn take_active(&mut self) -> Vec<u16> {
-        self.active.drain().collect()
+    /// Take all active blocks into reusable buffer (avoids allocation)
+    pub fn take_active(&mut self) -> &[u16] {
+        self.active_buffer.clear();
+        self.active_buffer.extend(self.active.drain());
+        &self.active_buffer
     }
 
     /// Check if this chunk has any water
+    #[inline]
     pub fn has_water(&self) -> bool {
         !self.levels.is_empty()
     }
 
     /// Check if this chunk has any active water to simulate
+    #[inline]
     pub fn has_active(&self) -> bool {
         !self.active.is_empty()
     }
 
     /// Get number of active blocks
+    #[inline]
     pub fn active_count(&self) -> usize {
         self.active.len()
     }
 
     /// Check if fluid state changed this tick
+    #[inline]
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
 
     /// Clear the dirty flag
+    #[inline]
     pub fn clear_dirty(&mut self) {
         self.dirty = false;
     }
 
     /// Get number of water blocks in this chunk
+    #[inline]
     pub fn water_count(&self) -> usize {
         self.levels.len()
     }
 
     /// Iterate over all water blocks in this chunk
     pub fn iter_water(&self) -> impl Iterator<Item = (u8, u8, u8, u8)> + '_ {
-        self.levels.iter().map(|(&packed, &level)| {
+        self.levels.iter().map(|(packed, level)| {
             let (x, y, z) = Self::unpack_coords(packed);
             (x, y, z, level)
         })
@@ -153,10 +293,20 @@ struct FluidUpdate {
     new_level: u8,
 }
 
+/// Neighbor info for horizontal flow calculations
+/// Using a struct instead of tuple for clarity
+struct NeighborInfo {
+    pos: (i32, i32, i32),
+    level: u8,
+    has_hole_below: bool,
+    #[allow(dead_code)]
+    can_flow: bool,
+}
+
 /// Global fluid simulation coordinator
 pub struct FluidSimulator {
     /// Per-chunk fluid states
-    pub chunk_states: HashMap<ChunkPos, ChunkFluidState>,
+    pub chunk_states: FxHashMap<ChunkPos, ChunkFluidState>,
 
     /// Configuration
     config: FluidConfig,
@@ -168,14 +318,20 @@ pub struct FluidSimulator {
     pending_updates: Vec<FluidUpdate>,
 
     /// Chunks that need remeshing after this tick
-    dirty_chunks: HashSet<ChunkPos>,
+    dirty_chunks: FxHashSet<ChunkPos>,
 
     /// Positions to mark active after updates applied
     pending_activations: Vec<(i32, i32, i32)>,
 
     /// Cache of positions known to be part of large water bodies (oceans)
     /// These blocks act as infinite sources
-    ocean_blocks: HashSet<(i32, i32, i32)>,
+    ocean_blocks: FxHashSet<(i32, i32, i32)>,
+
+    /// Reusable BFS visited set (avoids allocation each search)
+    bfs_visited: FxHashSet<(i32, i32, i32)>,
+
+    /// Reusable BFS queue (avoids allocation each search)
+    bfs_queue: VecDeque<(i32, i32, i32)>,
 }
 
 impl FluidSimulator {
@@ -185,19 +341,25 @@ impl FluidSimulator {
 
     pub fn with_config(config: FluidConfig) -> Self {
         Self {
-            chunk_states: HashMap::new(),
+            chunk_states: FxHashMap::default(),
             config,
             tick_accumulator: 0.0,
             pending_updates: Vec::with_capacity(1000),
-            dirty_chunks: HashSet::new(),
+            dirty_chunks: FxHashSet::default(),
             pending_activations: Vec::with_capacity(1000),
-            ocean_blocks: HashSet::new(),
+            ocean_blocks: FxHashSet::default(),
+            bfs_visited: FxHashSet::default(),
+            bfs_queue: VecDeque::with_capacity(1000),
         }
     }
 
     /// Initialize fluid state for a chunk that was just generated
     /// Call this when a chunk is created to register existing water blocks
-    pub fn init_chunk(&mut self, chunk_pos: ChunkPos, water_blocks: impl Iterator<Item = (u8, u8, u8)>) {
+    pub fn init_chunk(
+        &mut self,
+        chunk_pos: ChunkPos,
+        water_blocks: impl Iterator<Item = (u8, u8, u8)>,
+    ) {
         let state = self.chunk_states.entry(chunk_pos).or_default();
         for (x, y, z) in water_blocks {
             // Worldgen water starts at full level, NOT active (static until disturbed)
@@ -208,7 +370,11 @@ impl FluidSimulator {
 
     /// Scan a chunk from the World and register all water blocks
     /// Call this when loading/generating a chunk
-    pub fn scan_chunk_for_water(&mut self, chunk_pos: ChunkPos, blocks: &[[[BlockType; 16]; 16]; 16]) {
+    pub fn scan_chunk_for_water(
+        &mut self,
+        chunk_pos: ChunkPos,
+        blocks: &[[[BlockType; 16]; 16]; 16],
+    ) {
         let state = self.chunk_states.entry(chunk_pos).or_default();
         for x in 0..16 {
             for y in 0..16 {
@@ -223,47 +389,71 @@ impl FluidSimulator {
     }
 
     /// Remove fluid state for a chunk that was unloaded
+    /// Also invalidates ocean cache entries for this chunk
     pub fn unload_chunk(&mut self, chunk_pos: ChunkPos) {
         self.chunk_states.remove(&chunk_pos);
+
+        // Invalidate ocean cache for blocks in this chunk
+        self.ocean_blocks.retain(|&(x, y, z)| {
+            let (cp, _) = Self::world_to_chunk_local(x, y, z);
+            cp != chunk_pos
+        });
     }
 
     /// Called when a block is destroyed - activates adjacent water for simulation
     /// Also registers water blocks that weren't yet in the fluid system
     /// Propagates activation through the entire connected water body
-    pub fn on_block_destroyed_with_world(&mut self, world_x: i32, world_y: i32, world_z: i32, world: &World) {
-        use std::collections::VecDeque;
-
-        log::debug!("on_block_destroyed_with_world called at ({}, {}, {})", world_x, world_y, world_z);
+    pub fn on_block_destroyed_with_world(
+        &mut self,
+        world_x: i32,
+        world_y: i32,
+        world_z: i32,
+        world: &World,
+    ) {
+        #[cfg(debug_assertions)]
+        log::debug!(
+            "on_block_destroyed_with_world called at ({}, {}, {})",
+            world_x,
+            world_y,
+            world_z
+        );
 
         // Also check if we destroyed a water block - remove it from fluid system
         let destroyed_level = self.get_water_level(world_x, world_y, world_z);
         if destroyed_level > 0 {
-            log::debug!("Destroyed water block at ({}, {}, {}) with level {}", world_x, world_y, world_z, destroyed_level);
+            #[cfg(debug_assertions)]
+            log::debug!(
+                "Destroyed water block at ({}, {}, {}) with level {}",
+                world_x,
+                world_y,
+                world_z,
+                destroyed_level
+            );
             let (chunk_pos, local) = Self::world_to_chunk_local(world_x, world_y, world_z);
             if let Some(state) = self.chunk_states.get_mut(&chunk_pos) {
                 state.set_level(local.0, local.1, local.2, 0);
             }
         }
 
-        // Find all adjacent water blocks and propagate activation through connected water body
-        // Use BFS to find all connected water blocks
-        let mut visited = HashSet::new();
-        let mut queue = VecDeque::new();
+        // Use reusable BFS buffers
+        self.bfs_visited.clear();
+        self.bfs_queue.clear();
 
         // Start with immediate neighbors of destroyed block
-        let initial_neighbors = [
-            (world_x + 1, world_y, world_z),
-            (world_x - 1, world_y, world_z),
-            (world_x, world_y + 1, world_z),
-            (world_x, world_y - 1, world_z),
-            (world_x, world_y, world_z + 1),
-            (world_x, world_y, world_z - 1),
+        const NEIGHBORS: [(i32, i32, i32); 6] = [
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
         ];
 
-        for (nx, ny, nz) in initial_neighbors {
+        for (dx, dy, dz) in NEIGHBORS {
+            let (nx, ny, nz) = (world_x + dx, world_y + dy, world_z + dz);
             if let Some(BlockType::Water) = world.get_block(nx, ny, nz) {
-                queue.push_back((nx, ny, nz));
-                visited.insert((nx, ny, nz));
+                self.bfs_queue.push_back((nx, ny, nz));
+                self.bfs_visited.insert((nx, ny, nz));
             }
         }
 
@@ -271,8 +461,9 @@ impl FluidSimulator {
         const MAX_PROPAGATION: usize = 10000;
         let mut water_activated = 0;
 
-        while let Some((x, y, z)) = queue.pop_front() {
-            if visited.len() >= MAX_PROPAGATION {
+        while let Some((x, y, z)) = self.bfs_queue.pop_front() {
+            if self.bfs_visited.len() >= MAX_PROPAGATION {
+                #[cfg(debug_assertions)]
                 log::debug!("Hit propagation limit at {} blocks", MAX_PROPAGATION);
                 break;
             }
@@ -284,54 +475,60 @@ impl FluidSimulator {
 
             if current_level == 0 {
                 // Worldgen water not yet registered - register as full
-                log::debug!("Registering worldgen water at ({}, {}, {}) with level {}", x, y, z, MAX_WATER_LEVEL);
+                #[cfg(debug_assertions)]
+                log::debug!(
+                    "Registering worldgen water at ({}, {}, {}) with level {}",
+                    x,
+                    y,
+                    z,
+                    MAX_WATER_LEVEL
+                );
                 state.set_level(local.0, local.1, local.2, MAX_WATER_LEVEL);
             }
             state.mark_active(local.0, local.1, local.2);
             water_activated += 1;
 
             // Check neighbors and add unvisited water to queue
-            let neighbors = [
-                (x + 1, y, z),
-                (x - 1, y, z),
-                (x, y + 1, z),
-                (x, y - 1, z),
-                (x, y, z + 1),
-                (x, y, z - 1),
-            ];
-
-            for (nx, ny, nz) in neighbors {
-                if visited.contains(&(nx, ny, nz)) {
+            for (dx, dy, dz) in NEIGHBORS {
+                let (nx, ny, nz) = (x + dx, y + dy, z + dz);
+                if self.bfs_visited.contains(&(nx, ny, nz)) {
                     continue;
                 }
 
                 if let Some(BlockType::Water) = world.get_block(nx, ny, nz) {
-                    visited.insert((nx, ny, nz));
-                    queue.push_back((nx, ny, nz));
+                    self.bfs_visited.insert((nx, ny, nz));
+                    self.bfs_queue.push_back((nx, ny, nz));
                 }
             }
         }
 
         if water_activated > 0 {
-            log::debug!("Block destroyed at ({}, {}, {}): activated {} connected water blocks",
-                       world_x, world_y, world_z, water_activated);
+            #[cfg(debug_assertions)]
+            log::debug!(
+                "Block destroyed at ({}, {}, {}): activated {} connected water blocks",
+                world_x,
+                world_y,
+                world_z,
+                water_activated
+            );
         }
     }
 
     /// Called when a block is destroyed - activates adjacent water for simulation
     /// (Legacy version without world reference - only works for already-registered water)
     pub fn on_block_destroyed(&mut self, world_x: i32, world_y: i32, world_z: i32) {
-        // Check all 6 neighbors for water
-        let neighbors = [
-            (world_x + 1, world_y, world_z),
-            (world_x - 1, world_y, world_z),
-            (world_x, world_y + 1, world_z),
-            (world_x, world_y - 1, world_z),
-            (world_x, world_y, world_z + 1),
-            (world_x, world_y, world_z - 1),
+        // Check all 6 neighbors for water using batched iteration
+        const NEIGHBORS: [(i32, i32, i32); 6] = [
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
         ];
 
-        for (nx, ny, nz) in neighbors {
+        for (dx, dy, dz) in NEIGHBORS {
+            let (nx, ny, nz) = (world_x + dx, world_y + dy, world_z + dz);
             if self.get_water_level(nx, ny, nz) > 0 {
                 self.mark_active_world(nx, ny, nz);
             }
@@ -339,6 +536,7 @@ impl FluidSimulator {
     }
 
     /// Get water level at world coordinates
+    #[inline]
     pub fn get_water_level(&self, world_x: i32, world_y: i32, world_z: i32) -> u8 {
         let (chunk_pos, local) = Self::world_to_chunk_local(world_x, world_y, world_z);
         self.chunk_states
@@ -348,6 +546,7 @@ impl FluidSimulator {
     }
 
     /// Set water level at world coordinates (queues update)
+    #[inline]
     fn queue_water_update(&mut self, world_x: i32, world_y: i32, world_z: i32, level: u8) {
         self.pending_updates.push(FluidUpdate {
             world_x,
@@ -358,6 +557,7 @@ impl FluidSimulator {
     }
 
     /// Mark a world position as active for simulation
+    #[inline]
     fn mark_active_world(&mut self, world_x: i32, world_y: i32, world_z: i32) {
         let (chunk_pos, local) = Self::world_to_chunk_local(world_x, world_y, world_z);
         if let Some(state) = self.chunk_states.get_mut(&chunk_pos) {
@@ -366,18 +566,22 @@ impl FluidSimulator {
     }
 
     /// Queue a position to be marked active after updates are applied
+    #[inline]
     fn queue_activation(&mut self, world_x: i32, world_y: i32, world_z: i32) {
         self.pending_activations.push((world_x, world_y, world_z));
     }
 
     /// Queue activation of a block AND all its cardinal neighbors
     /// This helps propagate pressure changes further through water bodies
+    #[inline]
     fn queue_activation_with_neighbors(&mut self, world_x: i32, world_y: i32, world_z: i32) {
-        self.pending_activations.push((world_x, world_y, world_z));
-        self.pending_activations.push((world_x + 1, world_y, world_z));
-        self.pending_activations.push((world_x - 1, world_y, world_z));
-        self.pending_activations.push((world_x, world_y, world_z + 1));
-        self.pending_activations.push((world_x, world_y, world_z - 1));
+        self.pending_activations.extend([
+            (world_x, world_y, world_z),
+            (world_x + 1, world_y, world_z),
+            (world_x - 1, world_y, world_z),
+            (world_x, world_y, world_z + 1),
+            (world_x, world_y, world_z - 1),
+        ]);
     }
 
     /// Check if a position is part of a large water body (ocean)
@@ -392,9 +596,16 @@ impl FluidSimulator {
         let count = self.count_connected_water(x, y, z, world, OCEAN_THRESHOLD + 1);
 
         if count > OCEAN_THRESHOLD {
-            // This is an ocean - cache this block (and we could cache more from the flood)
+            // This is an ocean - cache this block
             self.ocean_blocks.insert((x, y, z));
-            log::debug!("Detected ocean at ({},{},{}): {} connected blocks", x, y, z, count);
+            #[cfg(debug_assertions)]
+            log::debug!(
+                "Detected ocean at ({},{},{}): {} connected blocks",
+                x,
+                y,
+                z,
+                count
+            );
             true
         } else {
             false
@@ -402,31 +613,38 @@ impl FluidSimulator {
     }
 
     /// Count connected full water blocks using BFS, stopping early if we exceed limit
-    fn count_connected_water(&self, start_x: i32, start_y: i32, start_z: i32, world: &World, limit: usize) -> usize {
-        use std::collections::VecDeque;
+    /// Uses reusable buffers to avoid allocation
+    fn count_connected_water(
+        &mut self,
+        start_x: i32,
+        start_y: i32,
+        start_z: i32,
+        world: &World,
+        limit: usize,
+    ) -> usize {
+        self.bfs_visited.clear();
+        self.bfs_queue.clear();
 
-        let mut visited = HashSet::new();
-        let mut queue = VecDeque::new();
-        queue.push_back((start_x, start_y, start_z));
-        visited.insert((start_x, start_y, start_z));
+        self.bfs_queue.push_back((start_x, start_y, start_z));
+        self.bfs_visited.insert((start_x, start_y, start_z));
 
-        while let Some((x, y, z)) = queue.pop_front() {
-            if visited.len() >= limit {
-                return visited.len(); // Early exit - definitely an ocean
+        const NEIGHBORS: [(i32, i32, i32); 6] = [
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
+        ];
+
+        while let Some((x, y, z)) = self.bfs_queue.pop_front() {
+            if self.bfs_visited.len() >= limit {
+                return self.bfs_visited.len(); // Early exit - definitely an ocean
             }
 
-            // Check 6 neighbors
-            let neighbors = [
-                (x + 1, y, z),
-                (x - 1, y, z),
-                (x, y + 1, z),
-                (x, y - 1, z),
-                (x, y, z + 1),
-                (x, y, z - 1),
-            ];
-
-            for (nx, ny, nz) in neighbors {
-                if visited.contains(&(nx, ny, nz)) {
+            for (dx, dy, dz) in NEIGHBORS {
+                let (nx, ny, nz) = (x + dx, y + dy, z + dz);
+                if self.bfs_visited.contains(&(nx, ny, nz)) {
                     continue;
                 }
 
@@ -435,39 +653,38 @@ impl FluidSimulator {
                 if level == MAX_WATER_LEVEL {
                     // Also verify it's actually water in the world
                     if let Some(BlockType::Water) = world.get_block(nx, ny, nz) {
-                        visited.insert((nx, ny, nz));
-                        queue.push_back((nx, ny, nz));
+                        self.bfs_visited.insert((nx, ny, nz));
+                        self.bfs_queue.push_back((nx, ny, nz));
                     }
                 }
             }
         }
 
-        visited.len()
+        self.bfs_visited.len()
     }
 
     /// Convert world coordinates to chunk position and local coordinates
+    /// Uses bitwise operations for speed (assumes CHUNK_SIZE = 16 = 2^4)
+    /// Rust's arithmetic right shift (>>) already floors toward negative infinity,
+    /// and bitwise AND (&) gives correct modulo for powers of 2.
     #[inline]
     fn world_to_chunk_local(world_x: i32, world_y: i32, world_z: i32) -> (ChunkPos, (u8, u8, u8)) {
-        const CHUNK_SIZE: i32 = 16;
-        let chunk_x = world_x.div_euclid(CHUNK_SIZE);
-        let chunk_y = world_y.div_euclid(CHUNK_SIZE);
-        let chunk_z = world_z.div_euclid(CHUNK_SIZE);
+        // Chunk position: arithmetic right shift by 4 (equivalent to div_euclid(16))
+        let chunk_x = world_x >> 4;
+        let chunk_y = world_y >> 4;
+        let chunk_z = world_z >> 4;
 
-        let local_x = world_x.rem_euclid(CHUNK_SIZE) as u8;
-        let local_y = world_y.rem_euclid(CHUNK_SIZE) as u8;
-        let local_z = world_z.rem_euclid(CHUNK_SIZE) as u8;
+        // Local coords: bitwise AND with 15 (equivalent to rem_euclid(16))
+        let local_x = (world_x & 0xF) as u8;
+        let local_y = (world_y & 0xF) as u8;
+        let local_z = (world_z & 0xF) as u8;
 
         ((chunk_x, chunk_y, chunk_z), (local_x, local_y, local_z))
     }
 
     /// Main update function - call each frame with delta time
     /// Returns set of chunks that need remeshing
-    pub fn update<F, G>(
-        &mut self,
-        dt: f32,
-        get_block: F,
-        mut set_block: G,
-    ) -> &HashSet<ChunkPos>
+    pub fn update<F, G>(&mut self, dt: f32, get_block: F, mut set_block: G) -> &FxHashSet<ChunkPos>
     where
         F: Fn(i32, i32, i32) -> Option<BlockType>,
         G: FnMut(i32, i32, i32, BlockType),
@@ -519,10 +736,16 @@ impl FluidSimulator {
             .map(|(&pos, _)| pos)
             .collect();
 
-        let total_active: usize = self.chunk_states.values().map(|s| s.active_count()).sum();
-        if total_active > 0 {
-            log::info!("simulate_tick_with_world: {} active chunks, {} total active blocks",
-                      chunk_positions.len(), total_active);
+        #[cfg(debug_assertions)]
+        {
+            let total_active: usize = self.chunk_states.values().map(|s| s.active_count()).sum();
+            if total_active > 0 {
+                log::info!(
+                    "simulate_tick_with_world: {} active chunks, {} total active blocks",
+                    chunk_positions.len(),
+                    total_active
+                );
+            }
         }
 
         for chunk_pos in chunk_positions {
@@ -530,12 +753,13 @@ impl FluidSimulator {
                 break;
             }
 
-            // Take active blocks from this chunk
-            let active_blocks = if let Some(state) = self.chunk_states.get_mut(&chunk_pos) {
-                state.take_active()
-            } else {
-                continue;
-            };
+            // Take active blocks from this chunk (uses reusable buffer)
+            let active_blocks: Vec<u16> =
+                if let Some(state) = self.chunk_states.get_mut(&chunk_pos) {
+                    state.take_active().to_vec()
+                } else {
+                    continue;
+                };
 
             for packed in active_blocks {
                 if blocks_processed >= self.config.max_blocks_per_tick {
@@ -581,8 +805,17 @@ impl FluidSimulator {
         let below_block = world.get_block(x, y - 1, z);
         let below_level = self.get_water_level(x, y - 1, z);
 
-        log::trace!("Simulating ({},{},{}): level={}, below={:?}, below_level={}, ocean={}",
-                  x, y, z, current_level, below_block, below_level, is_ocean);
+        #[cfg(debug_assertions)]
+        log::trace!(
+            "Simulating ({},{},{}): level={}, below={:?}, below_level={}, ocean={}",
+            x,
+            y,
+            z,
+            current_level,
+            below_block,
+            below_level,
+            is_ocean
+        );
 
         let can_flow_down = match below_block {
             Some(BlockType::Air) => true,
@@ -596,8 +829,18 @@ impl FluidSimulator {
             let flow_amount = current_level.min(space_below);
 
             if flow_amount > 0 {
-                log::debug!("Water DOWN ({},{},{}): {} -> {} (below_level={}, space={}, ocean={})",
-                          x, y, z, current_level, current_level - flow_amount, below_level, space_below, is_ocean);
+                #[cfg(debug_assertions)]
+                log::debug!(
+                    "Water DOWN ({},{},{}): {} -> {} (below_level={}, space={}, ocean={})",
+                    x,
+                    y,
+                    z,
+                    current_level,
+                    current_level - flow_amount,
+                    below_level,
+                    space_below,
+                    is_ocean
+                );
 
                 // Ocean blocks don't lose water - they act as infinite sources
                 if !is_ocean {
@@ -605,18 +848,26 @@ impl FluidSimulator {
                 }
                 self.queue_water_update(x, y - 1, z, below_level + flow_amount);
 
-                // Activate self and below for continued flow
-                self.queue_activation(x, y, z);
-                self.queue_activation(x, y - 1, z);
-                // Also activate horizontal neighbors in case they can now flow down
-                self.queue_activation(x + 1, y, z);
-                self.queue_activation(x - 1, y, z);
-                self.queue_activation(x, y, z + 1);
-                self.queue_activation(x, y, z - 1);
+                // Activate self, below, and horizontal neighbors in one batch
+                self.pending_activations.extend([
+                    (x, y, z),
+                    (x, y - 1, z),
+                    (x + 1, y, z),
+                    (x - 1, y, z),
+                    (x, y, z + 1),
+                    (x, y, z - 1),
+                ]);
                 return; // Prioritize downward flow
             }
         } else {
-            log::trace!("Cannot flow down from ({},{},{}): below={:?}", x, y, z, below_block);
+            #[cfg(debug_assertions)]
+            log::trace!(
+                "Cannot flow down from ({},{},{}): below={:?}",
+                x,
+                y,
+                z,
+                below_block
+            );
         }
 
         // Phase 2: Horizontal flow - Terraria style
@@ -624,30 +875,24 @@ impl FluidSimulator {
         // This makes water seek out holes to fall into
         // Include diagonal neighbors for more natural spreading
 
-        let horizontal_neighbors = [
+        const HORIZONTAL_NEIGHBORS: [(i32, i32); 8] = [
             // Cardinal directions (priority)
-            (x + 1, y, z),
-            (x - 1, y, z),
-            (x, y, z + 1),
-            (x, y, z - 1),
+            (1, 0),
+            (-1, 0),
+            (0, 1),
+            (0, -1),
             // Diagonal directions
-            (x + 1, y, z + 1),
-            (x + 1, y, z - 1),
-            (x - 1, y, z + 1),
-            (x - 1, y, z - 1),
+            (1, 1),
+            (1, -1),
+            (-1, 1),
+            (-1, -1),
         ];
 
-        // Collect info about each neighbor
-        struct NeighborInfo {
-            pos: (i32, i32, i32),
-            level: u8,
-            has_hole_below: bool,
-            can_flow: bool,
-        }
+        // Collect info about each neighbor using SmallVec (stack allocated for <= 8 elements)
+        let mut neighbors: SmallVec<[NeighborInfo; 8]> = SmallVec::new();
 
-        let mut neighbors: Vec<NeighborInfo> = Vec::new();
-
-        for (nx, ny, nz) in horizontal_neighbors {
+        for (dx, dz) in HORIZONTAL_NEIGHBORS {
+            let (nx, ny, nz) = (x + dx, y, z + dz);
             let block = world.get_block(nx, ny, nz);
             let can_flow = match block {
                 Some(BlockType::Air) => true,
@@ -679,7 +924,8 @@ impl FluidSimulator {
         }
 
         // Priority 1: Flow toward neighbors with holes below them (seeking lowest point)
-        let neighbors_with_holes: Vec<_> = neighbors.iter()
+        let neighbors_with_holes: SmallVec<[&NeighborInfo; 8]> = neighbors
+            .iter()
             .filter(|n| n.has_hole_below && n.level < current_level)
             .collect();
 
@@ -691,10 +937,23 @@ impl FluidSimulator {
                 for neighbor in &neighbors_with_holes {
                     let new_neighbor_level = (neighbor.level + 1).min(MAX_WATER_LEVEL);
                     if new_neighbor_level != neighbor.level {
-                        self.queue_water_update(neighbor.pos.0, neighbor.pos.1, neighbor.pos.2, new_neighbor_level);
+                        self.queue_water_update(
+                            neighbor.pos.0,
+                            neighbor.pos.1,
+                            neighbor.pos.2,
+                            new_neighbor_level,
+                        );
                         self.queue_activation(neighbor.pos.0, neighbor.pos.1, neighbor.pos.2);
-                        log::debug!("Water OCEAN SEEK HOLE ({},{},{})->({},{},{}): gave 1 (infinite)",
-                                   x, y, z, neighbor.pos.0, neighbor.pos.1, neighbor.pos.2);
+                        #[cfg(debug_assertions)]
+                        log::debug!(
+                            "Water OCEAN SEEK HOLE ({},{},{})->({},{},{}): gave 1 (infinite)",
+                            x,
+                            y,
+                            z,
+                            neighbor.pos.0,
+                            neighbor.pos.1,
+                            neighbor.pos.2
+                        );
                     }
                 }
                 self.queue_activation(x, y, z); // Keep ocean block active
@@ -706,17 +965,33 @@ impl FluidSimulator {
 
             let mut remaining = current_level;
             for neighbor in &neighbors_with_holes {
-                if remaining <= 1 { break; }
+                if remaining <= 1 {
+                    break;
+                }
                 let give = flow_per_neighbor.min(remaining - 1);
                 let new_neighbor_level = (neighbor.level + give).min(MAX_WATER_LEVEL);
                 let actual_give = new_neighbor_level - neighbor.level;
 
                 if actual_give > 0 {
-                    self.queue_water_update(neighbor.pos.0, neighbor.pos.1, neighbor.pos.2, new_neighbor_level);
+                    self.queue_water_update(
+                        neighbor.pos.0,
+                        neighbor.pos.1,
+                        neighbor.pos.2,
+                        new_neighbor_level,
+                    );
                     self.queue_activation(neighbor.pos.0, neighbor.pos.1, neighbor.pos.2);
                     remaining -= actual_give;
-                    log::debug!("Water SEEK HOLE ({},{},{})->({},{},{}): gave {}",
-                               x, y, z, neighbor.pos.0, neighbor.pos.1, neighbor.pos.2, actual_give);
+                    #[cfg(debug_assertions)]
+                    log::debug!(
+                        "Water SEEK HOLE ({},{},{})->({},{},{}): gave {}",
+                        x,
+                        y,
+                        z,
+                        neighbor.pos.0,
+                        neighbor.pos.1,
+                        neighbor.pos.2,
+                        actual_give
+                    );
                 }
             }
 
@@ -731,16 +1006,24 @@ impl FluidSimulator {
         // This creates proper water leveling across entire bodies
         if current_level > 0 {
             // Only use cardinal neighbors (first 4) for equalization
-            let cardinal_neighbors: Vec<_> = neighbors.iter()
-                .take(4)
-                .filter(|n| n.can_flow)
-                .collect();
+            let cardinal_neighbors: SmallVec<[&NeighborInfo; 4]> =
+                neighbors.iter().take(4).filter(|n| n.can_flow).collect();
 
             if !cardinal_neighbors.is_empty() {
                 // Find the minimum level among all connected blocks (including self)
-                let min_neighbor = cardinal_neighbors.iter().map(|n| n.level).min().unwrap_or(current_level);
+                let min_neighbor = cardinal_neighbors
+                    .iter()
+                    .map(|n| n.level)
+                    .min()
+                    .unwrap_or(current_level);
                 let min_level = current_level.min(min_neighbor);
-                let max_level = current_level.max(cardinal_neighbors.iter().map(|n| n.level).max().unwrap_or(current_level));
+                let max_level = current_level.max(
+                    cardinal_neighbors
+                        .iter()
+                        .map(|n| n.level)
+                        .max()
+                        .unwrap_or(current_level),
+                );
 
                 // Ocean blocks don't lose water when spreading horizontally
                 if is_ocean {
@@ -749,10 +1032,29 @@ impl FluidSimulator {
                         if neighbor.level < current_level {
                             let target = current_level.min(MAX_WATER_LEVEL);
                             if target != neighbor.level {
-                                self.queue_water_update(neighbor.pos.0, neighbor.pos.1, neighbor.pos.2, target);
-                                self.queue_activation_with_neighbors(neighbor.pos.0, neighbor.pos.1, neighbor.pos.2);
-                                log::debug!("Water OCEAN SPREAD ({},{},{})->({},{},{}): {} -> {} (infinite)",
-                                           x, y, z, neighbor.pos.0, neighbor.pos.1, neighbor.pos.2, neighbor.level, target);
+                                self.queue_water_update(
+                                    neighbor.pos.0,
+                                    neighbor.pos.1,
+                                    neighbor.pos.2,
+                                    target,
+                                );
+                                self.queue_activation_with_neighbors(
+                                    neighbor.pos.0,
+                                    neighbor.pos.1,
+                                    neighbor.pos.2,
+                                );
+                                #[cfg(debug_assertions)]
+                                log::debug!(
+                                    "Water OCEAN SPREAD ({},{},{})->({},{},{}): {} -> {} (infinite)",
+                                    x,
+                                    y,
+                                    z,
+                                    neighbor.pos.0,
+                                    neighbor.pos.1,
+                                    neighbor.pos.2,
+                                    neighbor.level,
+                                    target
+                                );
                             }
                         }
                     }
@@ -766,16 +1068,33 @@ impl FluidSimulator {
                 }
 
                 // Calculate equalized levels
-                let total_water: u16 = current_level as u16 + cardinal_neighbors.iter().map(|n| n.level as u16).sum::<u16>();
+                let total_water: u16 = current_level as u16
+                    + cardinal_neighbors
+                        .iter()
+                        .map(|n| n.level as u16)
+                        .sum::<u16>();
                 let num_blocks = 1 + cardinal_neighbors.len() as u16;
                 let avg_level = (total_water / num_blocks) as u8;
                 let remainder = (total_water % num_blocks) as u8;
 
-                log::debug!("Water EQUALIZE ({},{},{}): total={}, blocks={}, avg={}, remainder={}, range=[{},{}]",
-                           x, y, z, total_water, num_blocks, avg_level, remainder, min_level, max_level);
+                #[cfg(debug_assertions)]
+                log::debug!(
+                    "Water EQUALIZE ({},{},{}): total={}, blocks={}, avg={}, remainder={}, range=[{},{}]",
+                    x,
+                    y,
+                    z,
+                    total_water,
+                    num_blocks,
+                    avg_level,
+                    remainder,
+                    min_level,
+                    max_level
+                );
 
                 // Build list of all blocks with their current levels
-                let mut all_blocks: Vec<((i32, i32, i32), u8)> = vec![((x, y, z), current_level)];
+                let mut all_blocks: SmallVec<[((i32, i32, i32), u8); 5]> =
+                    SmallVec::with_capacity(5);
+                all_blocks.push(((x, y, z), current_level));
                 for n in &cardinal_neighbors {
                     all_blocks.push((n.pos, n.level));
                 }
@@ -785,17 +1104,40 @@ impl FluidSimulator {
                 // Distribute water and propagate activation to neighbors
                 let mut any_changed = false;
                 for (i, (pos, old_level)) in all_blocks.iter().enumerate() {
-                    let target_level = if (i as u8) < remainder { avg_level + 1 } else { avg_level };
+                    let target_level = if (i as u8) < remainder {
+                        avg_level + 1
+                    } else {
+                        avg_level
+                    };
                     if target_level != *old_level {
                         any_changed = true;
                         self.queue_water_update(pos.0, pos.1, pos.2, target_level);
                         // Use activation with neighbors to propagate pressure through the water body
                         self.queue_activation_with_neighbors(pos.0, pos.1, pos.2);
-                        if *pos == (x, y, z) {
-                            log::debug!("Water SELF ({},{},{}): {} -> {}", x, y, z, old_level, target_level);
-                        } else {
-                            log::debug!("Water SPREAD ({},{},{})->({},{},{}): {} -> {}",
-                                       x, y, z, pos.0, pos.1, pos.2, old_level, target_level);
+                        #[cfg(debug_assertions)]
+                        {
+                            if *pos == (x, y, z) {
+                                log::debug!(
+                                    "Water SELF ({},{},{}): {} -> {}",
+                                    x,
+                                    y,
+                                    z,
+                                    old_level,
+                                    target_level
+                                );
+                            } else {
+                                log::debug!(
+                                    "Water SPREAD ({},{},{})->({},{},{}): {} -> {}",
+                                    x,
+                                    y,
+                                    z,
+                                    pos.0,
+                                    pos.1,
+                                    pos.2,
+                                    old_level,
+                                    target_level
+                                );
+                            }
                         }
                     }
                 }
@@ -829,13 +1171,24 @@ impl FluidSimulator {
                 // Update the block type in the world
                 if update.new_level == 0 && old_level > 0 {
                     // Water removed - set to air
-                    log::debug!("Removing water block at ({}, {}, {})",
-                               update.world_x, update.world_y, update.world_z);
+                    #[cfg(debug_assertions)]
+                    log::debug!(
+                        "Removing water block at ({}, {}, {})",
+                        update.world_x,
+                        update.world_y,
+                        update.world_z
+                    );
                     world.set_block(update.world_x, update.world_y, update.world_z, BlockType::Air);
                 } else if update.new_level > 0 && old_level == 0 {
                     // Water added - set to water block
-                    log::debug!("Adding water block at ({}, {}, {}) with level {}",
-                               update.world_x, update.world_y, update.world_z, update.new_level);
+                    #[cfg(debug_assertions)]
+                    log::debug!(
+                        "Adding water block at ({}, {}, {}) with level {}",
+                        update.world_x,
+                        update.world_y,
+                        update.world_z,
+                        update.new_level
+                    );
                     world.set_block(
                         update.world_x,
                         update.world_y,
@@ -846,7 +1199,7 @@ impl FluidSimulator {
             }
         }
 
-        // Apply pending activations - collect first to avoid double borrow
+        // Apply pending activations - collect first to avoid borrow conflict
         let activations: Vec<_> = self.pending_activations.drain(..).collect();
         for (x, y, z) in activations {
             self.mark_active_world(x, y, z);
@@ -874,12 +1227,13 @@ impl FluidSimulator {
                 break;
             }
 
-            // Take active blocks from this chunk
-            let active_blocks = if let Some(state) = self.chunk_states.get_mut(&chunk_pos) {
-                state.take_active()
-            } else {
-                continue;
-            };
+            // Take active blocks from this chunk (uses reusable buffer)
+            let active_blocks: Vec<u16> =
+                if let Some(state) = self.chunk_states.get_mut(&chunk_pos) {
+                    state.take_active().to_vec()
+                } else {
+                    continue;
+                };
 
             for packed in active_blocks {
                 if blocks_processed >= self.config.max_blocks_per_tick {
@@ -934,29 +1288,27 @@ impl FluidSimulator {
                 self.queue_water_update(x, y, z, current_level - flow_amount);
                 self.queue_water_update(x, y - 1, z, below_level + flow_amount);
 
-                // Mark neighbors active for next tick
-                self.queue_activation(x, y, z);
-                self.queue_activation(x, y - 1, z);
-                self.queue_activation(x + 1, y, z);
-                self.queue_activation(x - 1, y, z);
-                self.queue_activation(x, y, z + 1);
-                self.queue_activation(x, y, z - 1);
+                // Batch all activations in one extend
+                self.pending_activations.extend([
+                    (x, y, z),
+                    (x, y - 1, z),
+                    (x + 1, y, z),
+                    (x - 1, y, z),
+                    (x, y, z + 1),
+                    (x, y, z - 1),
+                ]);
                 return; // Prioritize downward flow
             }
         }
 
         // Phase 2: Horizontal spreading (pressure equalization)
-        let horizontal_neighbors = [
-            (x + 1, y, z),
-            (x - 1, y, z),
-            (x, y, z + 1),
-            (x, y, z - 1),
-        ];
+        const HORIZONTAL_NEIGHBORS: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
 
         // Find neighbors we can flow into (lower level or air)
-        let mut flowable: Vec<(i32, i32, i32, u8)> = Vec::new();
+        let mut flowable: SmallVec<[(i32, i32, i32, u8); 4]> = SmallVec::new();
 
-        for (nx, ny, nz) in horizontal_neighbors {
+        for (dx, dz) in HORIZONTAL_NEIGHBORS {
+            let (nx, ny, nz) = (x + dx, y, z + dz);
             let block = get_block(nx, ny, nz);
             let can_flow = match block {
                 Some(BlockType::Air) => true,
@@ -1038,7 +1390,7 @@ impl FluidSimulator {
             }
         }
 
-        // Apply pending activations - collect first to avoid double borrow
+        // Apply pending activations - collect first to avoid borrow conflict
         let activations: Vec<_> = self.pending_activations.drain(..).collect();
         for (x, y, z) in activations {
             self.mark_active_world(x, y, z);
@@ -1051,10 +1403,7 @@ impl FluidSimulator {
         F: Fn(i32, i32, i32) -> Option<BlockType>,
     {
         let block = get_block(world_x, world_y, world_z);
-        let can_place = match block {
-            Some(BlockType::Air) | Some(BlockType::Water) => true,
-            _ => false,
-        };
+        let can_place = matches!(block, Some(BlockType::Air) | Some(BlockType::Water));
 
         if !can_place {
             return;
@@ -1080,24 +1429,31 @@ impl FluidSimulator {
                 state.set_level(local.0, local.1, local.2, 0);
                 self.dirty_chunks.insert(chunk_pos);
 
-                // Mark neighbors active
-                self.mark_active_world(world_x + 1, world_y, world_z);
-                self.mark_active_world(world_x - 1, world_y, world_z);
-                self.mark_active_world(world_x, world_y + 1, world_z);
-                self.mark_active_world(world_x, world_y - 1, world_z);
-                self.mark_active_world(world_x, world_y, world_z + 1);
-                self.mark_active_world(world_x, world_y, world_z - 1);
+                // Mark neighbors active using const array
+                const NEIGHBORS: [(i32, i32, i32); 6] = [
+                    (1, 0, 0),
+                    (-1, 0, 0),
+                    (0, 1, 0),
+                    (0, -1, 0),
+                    (0, 0, 1),
+                    (0, 0, -1),
+                ];
+                for (dx, dy, dz) in NEIGHBORS {
+                    self.mark_active_world(world_x + dx, world_y + dy, world_z + dz);
+                }
             }
         }
         level
     }
 
     /// Check if simulation is enabled
+    #[inline]
     pub fn is_enabled(&self) -> bool {
         self.config.enabled
     }
 
     /// Enable/disable fluid simulation
+    #[inline]
     pub fn set_enabled(&mut self, enabled: bool) {
         self.config.enabled = enabled;
     }
@@ -1157,5 +1513,74 @@ mod tests {
         let active = state.take_active();
         assert_eq!(active.len(), 1);
         assert!(!state.has_active());
+    }
+
+    #[test]
+    fn test_world_to_chunk_local_positive() {
+        // Test positive coordinates
+        let (chunk, local) = FluidSimulator::world_to_chunk_local(17, 33, 5);
+        assert_eq!(chunk, (1, 2, 0));
+        assert_eq!(local, (1, 1, 5));
+    }
+
+    #[test]
+    fn test_world_to_chunk_local_negative() {
+        // Test negative coordinates
+        // -1 >> 4 = -1, -1 & 15 = 15
+        // -17 >> 4 = -2, -17 & 15 = 15
+        // -32 >> 4 = -2, -32 & 15 = 0
+        let (chunk, local) = FluidSimulator::world_to_chunk_local(-1, -17, -32);
+        assert_eq!(chunk, (-1, -2, -2));
+        assert_eq!(local, (15, 15, 0));
+
+        // Additional edge case tests
+        // -16 >> 4 = -1, -16 & 15 = 0
+        let (chunk2, local2) = FluidSimulator::world_to_chunk_local(-16, -16, -16);
+        assert_eq!(chunk2, (-1, -1, -1));
+        assert_eq!(local2, (0, 0, 0));
+
+        // -17 >> 4 = -2, -17 & 15 = 15
+        let (chunk3, local3) = FluidSimulator::world_to_chunk_local(-17, -17, -17);
+        assert_eq!(chunk3, (-2, -2, -2));
+        assert_eq!(local3, (15, 15, 15));
+    }
+
+    #[test]
+    fn test_water_storage_sparse_to_dense() {
+        let mut storage = WaterStorage::default();
+
+        // Fill with water blocks up to threshold
+        for i in 0..DENSE_THRESHOLD {
+            storage.set(i as u16, 16);
+            // Conversion is triggered by ChunkFluidState::set_level, so call it manually
+            storage.maybe_convert_to_dense();
+        }
+
+        // Should have converted to dense
+        assert!(matches!(storage, WaterStorage::Dense(_)));
+        assert_eq!(storage.len(), DENSE_THRESHOLD);
+
+        // Values should still be accessible
+        for i in 0..DENSE_THRESHOLD {
+            assert_eq!(storage.get(i as u16), 16);
+        }
+    }
+
+    #[test]
+    fn test_water_storage_dense_to_sparse() {
+        let mut storage = WaterStorage::Dense(Box::new([0u8; 4096]));
+
+        // Set a few blocks
+        storage.set(0, 16);
+        storage.set(100, 8);
+
+        // Should convert back to sparse (below hysteresis threshold)
+        storage.maybe_convert_to_sparse();
+        assert!(matches!(storage, WaterStorage::Sparse(_)));
+
+        // Values should still be accessible
+        assert_eq!(storage.get(0), 16);
+        assert_eq!(storage.get(100), 8);
+        assert_eq!(storage.get(50), 0);
     }
 }
